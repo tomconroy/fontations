@@ -6,4 +6,4 @@ pub mod charstring;
 pub mod dict;
 pub mod font;
 
-pub use font::{Cff, CffFontBuilder, GlyphData, PrivateDictValues, TopDictValues};
+pub use font::{Cff, CffBuildError, CffFontBuilder, GlyphData, PrivateDictValues, TopDictValues};
