@@ -70,6 +70,9 @@ pub struct TopDictValues {
     pub underline_thickness: i32,
     /// Emitted when not `[0.001, 0, 0, 0.001, 0, 0]`; for a font with
     /// units-per-em `u` this is `[1/u, 0, 0, 1/u, 0, 0]`.
+    ///
+    /// Elements with integral values are written as integer operands (that
+    /// is how fontTools encodes the zeros ufo2ft passes as Python ints).
     pub font_matrix: Option<[f64; 6]>,
 }
 
@@ -373,7 +376,17 @@ fn compile_top_dict(
     if let Some(matrix) = values.font_matrix {
         if matrix != [0.001, 0.0, 0.0, 0.001, 0.0, 0.0] {
             for value in matrix {
-                dict::encode_real(&mut out, value);
+                // fontTools picks the operand encoding from the Python type,
+                // and ufo2ft builds the matrix as [1.0/upem, 0, 0, 1.0/upem,
+                // 0, 0] -- integer literals for the four zeros. Rust has one
+                // number type here, so key off the value instead: an integral
+                // element is written as an integer operand, which is what
+                // fontTools does for those literals (and is shorter besides).
+                if value.fract() == 0.0 && (value.abs() as i64) <= i32::MAX as i64 {
+                    dict::encode_int(&mut out, value as i32);
+                } else {
+                    dict::encode_real(&mut out, value);
+                }
             }
             Operator::FONT_MATRIX.write(&mut out);
         }
@@ -798,6 +811,54 @@ mod tests {
         // long consecutive run: format 1 wins
         let sids: Vec<u16> = (391..451).collect();
         assert_eq!(compile_charset(&sids), [1, 1, 135, 59]);
+    }
+
+    /// ufo2ft builds the matrix as `[1.0/upem, 0, 0, 1.0/upem, 0, 0]`, so
+    /// fontTools writes the scale as a real and the zeros as integers.
+    #[test]
+    fn font_matrix_zeros_are_integer_operands() {
+        let values = TopDictValues {
+            // upem 256, as in fontc's Float-Regular.ufo fixture
+            font_matrix: Some([1.0 / 256.0, 0.0, 0.0, 1.0 / 256.0, 0.0, 0.0]),
+            ..TopDictValues::new()
+        };
+        let dict = compile_top_dict(
+            &values,
+            &TopDictSids::default(),
+            [0; 4],
+            0,
+            &TopDictOffsets::default(),
+        );
+        // expectations produced by fontTools' encodeNumber
+        let operands: &[u8] = &[
+            0x1e, 0x39, 0x06, 0x25, 0xc8, 0xff, // 0.00390625
+            0x8b, 0x8b, // 0, 0
+            0x1e, 0x39, 0x06, 0x25, 0xc8, 0xff, // 0.00390625
+            0x8b, 0x8b, // 0, 0
+        ];
+        let mut expected = operands.to_vec();
+        Operator::FONT_MATRIX.write(&mut expected);
+        assert!(
+            dict.windows(expected.len()).any(|w| w == expected),
+            "FontMatrix not found in {dict:02x?}"
+        );
+        // the default matrix is still omitted entirely
+        let default_matrix = TopDictValues {
+            font_matrix: Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]),
+            ..TopDictValues::new()
+        };
+        let dict = compile_top_dict(
+            &default_matrix,
+            &TopDictSids::default(),
+            [0; 4],
+            0,
+            &TopDictOffsets::default(),
+        );
+        let mut font_matrix_op = Vec::new();
+        Operator::FONT_MATRIX.write(&mut font_matrix_op);
+        assert!(!dict
+            .windows(font_matrix_op.len())
+            .any(|w| w == font_matrix_op));
     }
 
     #[test]
