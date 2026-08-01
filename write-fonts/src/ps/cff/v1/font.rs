@@ -13,7 +13,10 @@ use std::collections::HashMap;
 use font_types::Tag;
 use read_fonts::{ps::string::STANDARD_STRINGS, TopLevelTable};
 
-use super::dict::{self, Operator};
+use super::{
+    charstring,
+    dict::{self, Operator},
+};
 use crate::{
     validate::{Validate, ValidationCtx},
     write::{FontWrite, TableWriter},
@@ -128,8 +131,12 @@ pub struct GlyphData {
     /// [`CharstringBuilder::build`][super::charstring::CharstringBuilder::build]
     /// with `width: None`).
     pub charstring: Vec<u8>,
-    /// Exact bounds of the (rounded) outline: `[x_min, y_min, x_max, y_max]`,
-    /// floor/ceil'd to integers; `None` for an empty glyph.
+    /// The charstring's bounds as `[x_min, y_min, x_max, y_max]`, each side
+    /// rounded with [`OtRound`] like ufo2ft; `None` for a glyph that draws
+    /// nothing (ufo2ft also treats an all-zero box as nothing).
+    ///
+    /// [`Charstring::bounds`][super::charstring::Charstring::bounds] produces
+    /// the unrounded rectangle.
     pub bounds: Option<[i32; 4]>,
 }
 
@@ -140,6 +147,10 @@ pub enum CffBuildError {
     NoGlyphs,
     /// The first glyph must be named `.notdef`
     FirstGlyphNotNotdef,
+    /// A charstring operand does not fit the Type 2 integer range
+    OperandOutOfRange { value: i32 },
+    /// More strings than the 16-bit SID space can identify
+    TooManyStrings,
 }
 
 impl std::fmt::Display for CffBuildError {
@@ -148,6 +159,13 @@ impl std::fmt::Display for CffBuildError {
             CffBuildError::NoGlyphs => write!(f, "a CFF font requires at least one glyph"),
             CffBuildError::FirstGlyphNotNotdef => {
                 write!(f, "the first glyph in a CFF font must be '.notdef'")
+            }
+            CffBuildError::OperandOutOfRange { value } => write!(
+                f,
+                "charstring operand {value} is outside the Type 2 integer range"
+            ),
+            CffBuildError::TooManyStrings => {
+                write!(f, "a CFF font cannot hold more than 65535 strings")
             }
         }
     }
@@ -210,16 +228,18 @@ impl CffFontBuilder {
                 // like ufo2ft: compare the unrounded width to defaultWidthX,
                 // and only round the delta that gets written
                 if g.advance_width == default_width as f64 {
-                    g.charstring.clone()
+                    Ok(g.charstring.clone())
                 } else {
                     let delta: i32 = (g.advance_width - nominal_width as f64).ot_round();
                     let mut program = Vec::with_capacity(g.charstring.len() + 3);
-                    dict::encode_int(&mut program, delta);
+                    // a charstring operand, not a DICT operand: the widest
+                    // form here is 3 bytes
+                    charstring::encode_int(&mut program, delta)?;
                     program.extend_from_slice(&g.charstring);
-                    program
+                    Ok(program)
                 }
             })
-            .collect();
+            .collect::<Result<_, CffBuildError>>()?;
 
         // SIDs: non-standard glyph names intern first (in glyph order,
         // via the charset), then Top DICT string values in operator order.
@@ -227,26 +247,18 @@ impl CffFontBuilder {
         let charset_sids: Vec<u16> = self.glyphs[1..]
             .iter()
             .map(|g| strings.get_sid(&g.name))
-            .collect();
+            .collect::<Result<_, _>>()?;
+        let sid = |strings: &mut StringInterner, s: &Option<String>| match s {
+            Some(s) => strings.get_sid(s).map(Some),
+            None => Ok(None),
+        };
         let top_dict_sids = TopDictSids {
-            version: self.top_dict.version.as_deref().map(|s| strings.get_sid(s)),
-            notice: self.top_dict.notice.as_deref().map(|s| strings.get_sid(s)),
-            copyright: self
-                .top_dict
-                .copyright
-                .as_deref()
-                .map(|s| strings.get_sid(s)),
-            full_name: self
-                .top_dict
-                .full_name
-                .as_deref()
-                .map(|s| strings.get_sid(s)),
-            family_name: self
-                .top_dict
-                .family_name
-                .as_deref()
-                .map(|s| strings.get_sid(s)),
-            weight: self.top_dict.weight.as_deref().map(|s| strings.get_sid(s)),
+            version: sid(&mut strings, &self.top_dict.version)?,
+            notice: sid(&mut strings, &self.top_dict.notice)?,
+            copyright: sid(&mut strings, &self.top_dict.copyright)?,
+            full_name: sid(&mut strings, &self.top_dict.full_name)?,
+            family_name: sid(&mut strings, &self.top_dict.family_name)?,
+            weight: sid(&mut strings, &self.top_dict.weight)?,
         };
 
         let font_bbox = self
@@ -263,7 +275,12 @@ impl CffFontBuilder {
             })
             .unwrap_or_default();
 
-        let charset = compile_charset(&charset_sids);
+        // a charset the reader already knows needs no block of its own
+        let predefined_charset = predefined_charset(&charset_sids);
+        let charset = match predefined_charset {
+            Some(_) => Vec::new(),
+            None => compile_charset(&charset_sids),
+        };
         let charstrings_index = compile_index(&charstrings);
         let private_dict = compile_private_dict(&self.private, default_width, nominal_width);
 
@@ -286,6 +303,7 @@ impl CffFontBuilder {
                 &top_dict_sids,
                 font_bbox,
                 private_dict.len(),
+                predefined_charset,
                 &offsets,
             );
             let top_dict_index = index_size(&[top_dict_data.len()]);
@@ -341,6 +359,7 @@ fn compile_top_dict(
     sids: &TopDictSids,
     font_bbox: [i32; 4],
     private_size: usize,
+    predefined_charset: Option<u8>,
     offsets: &TopDictOffsets,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -397,7 +416,10 @@ fn compile_top_dict(
         }
         Operator::FONT_BBOX.write(&mut out);
     }
-    dict::encode_int(&mut out, offsets.charset as i32);
+    // fontTools writes the predefined id here even when it is 0 (the DICT
+    // default): it fills in `charset` after the pass that drops defaults
+    let charset = predefined_charset.map_or(offsets.charset as i32, i32::from);
+    dict::encode_int(&mut out, charset);
     Operator::CHARSET.write(&mut out);
     dict::encode_int(&mut out, private_size as i32);
     dict::encode_int(&mut out, offsets.private as i32);
@@ -491,17 +513,18 @@ impl StringInterner {
         }
     }
 
-    fn get_sid(&mut self, s: &str) -> u16 {
+    fn get_sid(&mut self, s: &str) -> Result<u16, CffBuildError> {
         if let Some(sid) = standard_sid(s) {
-            return sid;
+            return Ok(sid);
         }
         if let Some(sid) = self.lookup.get(s) {
-            return *sid;
+            return Ok(*sid);
         }
-        let sid = (STANDARD_STRINGS.len() + self.strings.len()) as u16;
+        let sid = u16::try_from(STANDARD_STRINGS.len() + self.strings.len())
+            .map_err(|_| CffBuildError::TooManyStrings)?;
         self.strings.push(s.to_string());
         self.lookup.insert(s.to_string(), sid);
-        sid
+        Ok(sid)
     }
 }
 
@@ -517,6 +540,66 @@ fn standard_sid(s: &str) -> Option<u16> {
         })
         .get(s)
         .copied()
+}
+
+/// The Expert charset (CFF spec appendix C), as SIDs: every name in it is a
+/// standard string, and standard strings are unique, so comparing SIDs is the
+/// same test fontTools' `getStdCharSet` makes on names.
+#[rustfmt::skip]
+const EXPERT_CHARSET: &[u16] = &[
+    0, 1, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238,
+    13, 14, 15, 99, 239, 240, 241, 242, 243, 244, 245, 246,
+    247, 248, 27, 28, 249, 250, 251, 252, 253, 254, 255, 256,
+    257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 109, 110,
+    267, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, 278,
+    279, 280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 290,
+    291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301, 302,
+    303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
+    315, 316, 317, 318, 158, 155, 163, 319, 320, 321, 322, 323,
+    324, 325, 326, 150, 164, 169, 327, 328, 329, 330, 331, 332,
+    333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344,
+    345, 346, 347, 348, 349, 350, 351, 352, 353, 354, 355, 356,
+    357, 358, 359, 360, 361, 362, 363, 364, 365, 366, 367, 368,
+    369, 370, 371, 372, 373, 374, 375, 376, 377, 378,
+];
+
+/// The Expert Subset charset, as SIDs. See [`EXPERT_CHARSET`].
+#[rustfmt::skip]
+const EXPERT_SUBSET_CHARSET: &[u16] = &[
+    0, 1, 231, 232, 235, 236, 237, 238, 13, 14, 15, 99,
+    239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 27, 28,
+    249, 250, 251, 253, 254, 255, 256, 257, 258, 259, 260, 261,
+    262, 263, 264, 265, 266, 109, 110, 267, 268, 269, 270, 272,
+    300, 301, 302, 305, 314, 315, 158, 155, 163, 320, 321, 322,
+    323, 324, 325, 326, 150, 164, 169, 327, 328, 329, 330, 331,
+    332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343,
+    344, 345, 346,
+];
+
+/// The ISOAdobe charset is the first 229 standard strings, in order.
+const ISO_ADOBE_CHARSET_LEN: usize = 229;
+
+/// Port of fontTools' `getStdCharSet`: the id of the predefined charset whose
+/// order the glyph names follow, if any. `sids` excludes `.notdef`, which is
+/// the first entry of every predefined charset.
+fn predefined_charset(sids: &[u16]) -> Option<u8> {
+    let is_prefix_of = |charset: &[u16]| {
+        sids.len() < charset.len() && sids.iter().zip(&charset[1..]).all(|(a, b)| a == b)
+    };
+    if sids.len() < ISO_ADOBE_CHARSET_LEN
+        && sids
+            .iter()
+            .enumerate()
+            .all(|(i, sid)| *sid as usize == i + 1)
+    {
+        Some(0)
+    } else if is_prefix_of(EXPERT_CHARSET) {
+        Some(1)
+    } else if is_prefix_of(EXPERT_SUBSET_CHARSET) {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 /// Compile the charset, choosing the smallest of format 0/1/2 like fontTools
@@ -813,6 +896,75 @@ mod tests {
         assert_eq!(compile_charset(&sids), [1, 1, 135, 59]);
     }
 
+    #[test]
+    fn predefined_charset_ids() {
+        // .notdef, space, exclam: the start of ISOAdobe
+        assert_eq!(predefined_charset(&[1, 2]), Some(0));
+        // .notdef, space, bar
+        assert_eq!(predefined_charset(&[1, 93]), None);
+        // the whole ISOAdobe charset is 229 names, .notdef included
+        assert_eq!(predefined_charset(&(1..229).collect::<Vec<_>>()), Some(0));
+        assert_eq!(predefined_charset(&(1..230).collect::<Vec<_>>()), None);
+        // .notdef, space, exclamsmall, Hungarumlautsmall
+        assert_eq!(predefined_charset(&[1, 229, 230]), Some(1));
+        // .notdef, space, exclamsmall, dollaroldstyle: Expert Subset skips
+        // Hungarumlautsmall, so this is not Expert
+        assert_eq!(predefined_charset(&[1, 229, 231]), None);
+        assert_eq!(predefined_charset(&[1, 231, 232]), Some(2));
+    }
+
+    /// A font whose glyph names start the ISOAdobe charset writes the
+    /// predefined id and no charset block. These are the bytes fontTools
+    /// produces for the same font.
+    #[test]
+    fn iso_adobe_charset_matches_fonttools() {
+        use super::super::charstring::CharstringBuilder;
+        use kurbo::Point;
+
+        fn corner(size: f64) -> Vec<u8> {
+            let mut pen = CharstringBuilder::new();
+            pen.move_to(Point::new(0.0, 0.0));
+            pen.line_to(Point::new(size, 0.0));
+            pen.line_to(Point::new(size, size));
+            pen.close_path();
+            pen.build(None, true).unwrap().bytes
+        }
+
+        let top_dict = TopDictValues {
+            version: Some("1.0".into()),
+            full_name: Some("Test Regular".into()),
+            family_name: Some("Test".into()),
+            font_matrix: Some([0.001, 0.0, 0.0, 0.001, 0.0, 0.0]),
+            ..TopDictValues::new()
+        };
+        let mut builder = CffFontBuilder::new(
+            "Test-Regular".into(),
+            top_dict,
+            PrivateDictValues::default(),
+        );
+        for (name, size) in [(".notdef", 100.0), ("space", 0.0), ("exclam", 50.0)] {
+            builder.add_glyph(GlyphData {
+                name: name.into(),
+                advance_width: 500.0,
+                charstring: if size == 0.0 {
+                    CharstringBuilder::new().build(None, true).unwrap().bytes
+                } else {
+                    corner(size)
+                },
+                bounds: (size != 0.0).then_some([0, 0, size as i32, size as i32]),
+            });
+        }
+        let cff = builder.build().unwrap();
+        let hex: String = cff.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "01000401000101010d546573742d526567756c61720001010116f81b00f81c02\
+             f81d038b8befef058b0f91ea12d61100030101041014312e30546573742052\
+             6567756c61725465737400000003010107080e8b16efef060e0e8b16bdbd06\
+             0ef88814f88815"
+        );
+    }
+
     /// ufo2ft builds the matrix as `[1.0/upem, 0, 0, 1.0/upem, 0, 0]`, so
     /// fontTools writes the scale as a real and the zeros as integers.
     #[test]
@@ -827,6 +979,7 @@ mod tests {
             &TopDictSids::default(),
             [0; 4],
             0,
+            None,
             &TopDictOffsets::default(),
         );
         // expectations produced by fontTools' encodeNumber
@@ -852,6 +1005,7 @@ mod tests {
             &TopDictSids::default(),
             [0; 4],
             0,
+            None,
             &TopDictOffsets::default(),
         );
         let mut font_matrix_op = Vec::new();
@@ -938,7 +1092,7 @@ mod tests {
                 pen.line_to(Point::new(*x, *y));
             }
             pen.close_path();
-            pen.build(None, true)
+            pen.build(None, true).unwrap().bytes
         }
 
         fn contours(contours: &[&[(f64, f64)]]) -> Vec<u8> {
@@ -952,7 +1106,7 @@ mod tests {
                 }
                 pen.close_path();
             }
-            pen.build(None, true)
+            pen.build(None, true).unwrap().bytes
         }
 
         let top_dict = TopDictValues {
@@ -997,7 +1151,7 @@ mod tests {
         builder.add_glyph(GlyphData {
             name: "space".into(),
             advance_width: 500.0,
-            charstring: CharstringBuilder::new().build(None, true),
+            charstring: CharstringBuilder::new().build(None, true).unwrap().bytes,
             bounds: None,
         });
         builder.add_glyph(GlyphData {
@@ -1033,7 +1187,7 @@ mod tests {
         builder.add_glyph(GlyphData {
             name: "element_of".into(),
             advance_width: 500.0,
-            charstring: CharstringBuilder::new().build(None, true),
+            charstring: CharstringBuilder::new().build(None, true).unwrap().bytes,
             bounds: None,
         });
 

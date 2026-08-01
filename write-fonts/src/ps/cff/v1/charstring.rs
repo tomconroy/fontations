@@ -10,8 +10,9 @@
 //! `cffLib.specializer.specializeCommands`, producing the same operator
 //! choices as fontmake/ufo2ft at CFF optimization level 1.
 
-use kurbo::{BezPath, PathEl, Point};
+use kurbo::{BezPath, CubicBez, ParamCurveExtrema, PathEl, Point, Rect, Vec2};
 
+use super::CffBuildError;
 use crate::OtRound;
 
 /// Type 2 charstring operators (single byte).
@@ -92,6 +93,22 @@ fn categorize(dx: i32, dy: i32) -> (Cat, Vec<i32>) {
     }
 }
 
+/// A compiled charstring and the bounds of the outline it draws.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Charstring {
+    /// The charstring program.
+    pub bytes: Vec<u8>,
+    /// Exact bounds of the outline *as this program draws it*, or `None` if
+    /// it draws nothing.
+    ///
+    /// ufo2ft measures the compiled charstring, not the source outline, and
+    /// specialization can drop geometry: a stray point merges into the
+    /// preceding moveto, a backtracking segment merges into a collinear
+    /// neighbour. Bounds taken from the source path would enclose points the
+    /// font does not contain.
+    pub bounds: Option<Rect>,
+}
+
 /// Builds a Type 2 charstring from absolute path commands.
 ///
 /// Input coordinates are rounded with [`OtRound`] before deltas are taken,
@@ -102,6 +119,8 @@ pub struct CharstringBuilder {
     commands: Vec<Command>,
     /// current (rounded) position
     pos: (i32, i32),
+    /// current position before rounding, as fontTools' `BasePen` keeps it
+    exact_pos: Point,
 }
 
 impl CharstringBuilder {
@@ -113,6 +132,7 @@ impl CharstringBuilder {
         let (x, y): (i32, i32) = (pt.x.ot_round(), pt.y.ot_round());
         let delta = (x - self.pos.0, y - self.pos.1);
         self.pos = (x, y);
+        self.exact_pos = pt;
         delta
     }
 
@@ -154,7 +174,10 @@ impl CharstringBuilder {
                 PathEl::LineTo(p) => self.line_to(p),
                 PathEl::CurveTo(p1, p2, p3) => self.curve_to(p1, p2, p3),
                 PathEl::QuadTo(p1, p2) => {
-                    let p0 = Point::new(self.pos.0 as f64, self.pos.1 as f64);
+                    // fontTools' BasePen raises the quadratic from the
+                    // *unrounded* current point and rounds the cubic once, so
+                    // rounding the input first would round twice
+                    let p0 = self.exact_pos;
                     let c1 = p0 + (p1 - p0) * (2.0 / 3.0);
                     let c2 = p2 + (p1 - p2) * (2.0 / 3.0);
                     self.curve_to(c1, c2, p2);
@@ -164,31 +187,40 @@ impl CharstringBuilder {
         }
     }
 
-    /// Serialize the charstring.
+    /// Serialize the charstring, and measure what it draws.
     ///
     /// `width` is the width delta to prepend (already relative to
     /// `nominalWidthX`), or `None` if the glyph advance equals
     /// `defaultWidthX`. When `specialize` is false the program uses only
     /// generalized operators (`rmoveto`/`rlineto`/`rrcurveto`), like
     /// fontmake's `--optimize-cff 0`.
-    pub fn build(self, width: Option<i32>, specialize: bool) -> Vec<u8> {
+    pub fn build(self, width: Option<i32>, specialize: bool) -> Result<Charstring, CffBuildError> {
+        // passes 1-3 add, merge and delete segments, so they run before the
+        // outline is measured; passes 4-6 only choose an encoding for it
         let commands = if specialize {
-            specialize_commands(self.commands)
+            specialize_geometry(self.commands)
         } else {
             self.commands
         };
-        let mut out = Vec::new();
+        let bounds = command_bounds(&commands);
+        let commands = if specialize {
+            specialize_encoding(commands)
+        } else {
+            commands
+        };
+
+        let mut bytes = Vec::new();
         if let Some(width) = width {
-            encode_int(&mut out, width);
+            encode_int(&mut bytes, width)?;
         }
         for (op, args) in &commands {
             for arg in args {
-                encode_int(&mut out, *arg);
+                encode_int(&mut bytes, *arg)?;
             }
-            out.push(operator_byte(op));
+            bytes.push(operator_byte(op));
         }
-        out.push(opcode::ENDCHAR);
-        out
+        bytes.push(opcode::ENDCHAR);
+        Ok(Charstring { bytes, bounds })
     }
 }
 
@@ -213,9 +245,10 @@ fn operator_byte(op: &Op) -> u8 {
 
 /// Encode a Type 2 charstring integer operand.
 ///
-/// Unlike DICT integers there is no 5-byte form; values outside the i16
-/// range cannot be represented and do not occur in valid outlines.
-fn encode_int(out: &mut Vec<u8>, value: i32) {
+/// Unlike DICT integers there is no 5-byte integer form; a value outside the
+/// i16 range cannot be represented. (fontTools emits the 16.16 fixed form for
+/// these, which silently mangles the value, so we report an error instead.)
+pub(super) fn encode_int(out: &mut Vec<u8>, value: i32) -> Result<(), CffBuildError> {
     match value {
         -107..=107 => out.push((value + 139) as u8),
         108..=1131 => {
@@ -232,14 +265,77 @@ fn encode_int(out: &mut Vec<u8>, value: i32) {
             out.push(28);
             out.extend_from_slice(&(value as i16).to_be_bytes());
         }
-        _ => panic!("charstring operand {value} exceeds the Type 2 integer range"),
+        _ => return Err(CffBuildError::OperandOutOfRange { value }),
     }
+    Ok(())
 }
 
-/// Port of fontTools `cffLib.specializer.specializeCommands` (with
+/// Bounds of the outline a command list draws, like fontTools' `BoundsPen`:
+/// curve-exact, and a moveto contributes its point even if nothing follows.
+///
+/// Expects commands in the form specialization passes 1-3 leave them, where
+/// every command is still a single segment.
+fn command_bounds(commands: &[Command]) -> Option<Rect> {
+    /// The delta a category-reduced argument list encodes, and how many
+    /// arguments it consumed.
+    fn delta(cat: Cat, args: &[i32]) -> (Vec2, usize) {
+        match cat {
+            Cat::Zero => (Vec2::ZERO, 1),
+            Cat::H => (Vec2::new(args[0] as f64, 0.0), 1),
+            Cat::V => (Vec2::new(0.0, args[0] as f64), 1),
+            Cat::R => (Vec2::new(args[0] as f64, args[1] as f64), 2),
+        }
+    }
+
+    let mut bounds: Option<Rect> = None;
+    let mut pos = Point::ZERO;
+    for (op, args) in commands {
+        match op {
+            Op::Move(cat) | Op::Line(cat) => {
+                pos += delta(*cat, args).0;
+                bounds = Some(match bounds {
+                    Some(bounds) => bounds.union_pt(pos),
+                    None => Rect::from_points(pos, pos),
+                });
+            }
+            Op::Curve(c0, c1) => {
+                let (d1, used) = delta(*c0, args);
+                let p1 = pos + d1;
+                let p2 = p1 + Vec2::new(args[used] as f64, args[used + 1] as f64);
+                let p3 = p2 + delta(*c1, &args[used + 2..]).0;
+                let curve = CubicBez::new(pos, p1, p2, p3).bounding_box();
+                bounds = Some(match bounds {
+                    Some(bounds) => bounds.union(curve),
+                    None => curve,
+                });
+                pos = p3;
+            }
+            Op::CurveLine | Op::LineCurve => {
+                unreachable!("outlines are measured before operators are combined")
+            }
+        }
+    }
+    bounds
+}
+
+/// Outcome of testing whether two adjacent operators can be combined.
+///
+/// fontTools distinguishes two kinds of failure: falling off the end of the
+/// merge logic with `new_op = None` (which still records the left operand's
+/// stack use), and `continue`, which leaves `stackUse` untouched. The
+/// difference is observable: a stale, larger `stackUse` refuses later merges.
+enum Merge {
+    Into(Op),
+    No,
+    Skip,
+}
+
+/// Passes 1-3 of fontTools `cffLib.specializer.specializeCommands` (with
 /// `generalizeFirst=False, preserveTopology=False, maxstack=48`), operating
 /// on generalized integer commands.
-fn specialize_commands(mut commands: Vec<Command>) -> Vec<Command> {
+///
+/// These are the passes that change which points the outline contains.
+fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
     // 1. Combine successive rmoveto operations.
     let mut i = commands.len().saturating_sub(1);
     while i > 0 {
@@ -300,6 +396,12 @@ fn specialize_commands(mut commands: Vec<Command>) -> Vec<Command> {
         }
     }
 
+    commands
+}
+
+/// Passes 4-6 of fontTools' `specializeCommands`: they pick operators and
+/// argument layouts for an outline that is already final.
+fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
     // 4. Peephole: revert h/v variants between r-variants if that saves a byte.
     if commands.len() > 2 {
         for i in 1..commands.len() - 1 {
@@ -350,42 +452,52 @@ fn specialize_commands(mut commands: Vec<Command>) -> Vec<Command> {
         let (op1, _) = &commands[i - 1];
         let (op2, args2) = &commands[i];
 
-        let new_op = match (op1, op2) {
-            (Op::Line(Cat::R), Op::Line(Cat::R)) => Some(Op::Line(Cat::R)),
+        let outcome = match (op1, op2) {
+            (Op::Line(Cat::R), Op::Line(Cat::R)) => Merge::Into(Op::Line(Cat::R)),
             (Op::Curve(Cat::R, Cat::R), Op::Curve(Cat::R, Cat::R)) => {
-                Some(Op::Curve(Cat::R, Cat::R))
+                Merge::Into(Op::Curve(Cat::R, Cat::R))
             }
             (Op::Line(Cat::R), Op::Curve(Cat::R, Cat::R)) if args2.len() == 6 => {
-                Some(Op::LineCurve)
+                Merge::Into(Op::LineCurve)
             }
             (Op::Curve(Cat::R, Cat::R), Op::Line(Cat::R)) if args2.len() == 2 => {
-                Some(Op::CurveLine)
+                Merge::Into(Op::CurveLine)
             }
-            (Op::Line(Cat::R), Op::LineCurve) => Some(Op::LineCurve),
-            (Op::Curve(Cat::R, Cat::R), Op::CurveLine) => Some(Op::CurveLine),
+            (Op::Line(Cat::R), Op::LineCurve) => Merge::Into(Op::LineCurve),
+            (Op::Curve(Cat::R, Cat::R), Op::CurveLine) => Merge::Into(Op::CurveLine),
             (Op::Line(Cat::H), Op::Line(Cat::V)) | (Op::Line(Cat::V), Op::Line(Cat::H)) => {
-                Some(op1.clone())
+                Merge::Into(op1.clone())
             }
             (Op::Curve(d0, d1), Op::Curve(d2, d3)) => {
                 let (d0, d1, d2, d3) = (*d0, *d1, *d2, *d3);
+                // Every rejection in this branch is a `continue` in fontTools,
+                // which skips the stack-use bookkeeping below.
                 if d1 == Cat::R || d2 == Cat::R || (d0 == Cat::R && d3 == Cat::R) {
-                    None
+                    Merge::Skip
                 } else {
                     match d1.merge(d2) {
-                        None => None,
+                        None => Merge::Skip,
                         Some(d) => {
-                            if d0 == Cat::R {
+                            let merged = if d0 == Cat::R {
                                 d.merge(d3).map(|d| Op::Curve(Cat::R, d))
                             } else if d3 == Cat::R {
                                 d0.merge(d.negate()).map(|d0| Op::Curve(d0, Cat::R))
                             } else {
                                 d0.merge(d3).map(|d0| Op::Curve(d0, d))
-                            }
+                            };
+                            merged.map_or(Merge::Skip, Merge::Into)
                         }
                     }
                 }
             }
-            _ => None,
+            _ => Merge::No,
+        };
+        let new_op = match outcome {
+            // fontTools reaches the next iteration without touching stackUse,
+            // so the stale value keeps blocking merges further left.
+            Merge::Skip => continue,
+            Merge::No => None,
+            Merge::Into(op) => Some(op),
         };
 
         let args1_stack_use = commands[i - 1].1.len();
@@ -469,7 +581,7 @@ mod tests {
         pen.line_to(Point::new(250.0, 700.0));
         pen.line_to(Point::new(50.0, 700.0));
         pen.close_path();
-        pen.build(width, specialize)
+        pen.build(width, specialize).unwrap().bytes
     }
 
     #[test]
@@ -496,17 +608,17 @@ mod tests {
         );
         pen.line_to(Point::new(0.0, 20.0));
         pen.close_path();
-        let bytes = pen.build(None, true);
+        let bytes = pen.build(None, true).unwrap().bytes;
         let mut expected = Vec::new();
         for v in [0i32] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::HMOVETO);
         for v in [10i32, 10, 10, 10] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::HVCURVETO);
-        encode_int(&mut expected, -20);
+        encode_int(&mut expected, -20).unwrap();
         expected.push(opcode::HLINETO);
         expected.push(opcode::ENDCHAR);
         assert_eq!(bytes, expected);
@@ -525,18 +637,18 @@ mod tests {
         );
         pen.line_to(Point::new(0.0, 20.0));
         pen.close_path();
-        let bytes = pen.build(None, false);
+        let bytes = pen.build(None, false).unwrap().bytes;
         let mut expected = Vec::new();
         for v in [0i32, 0] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RMOVETO);
         for v in [10i32, 0, 10, 10, 0, 10] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RRCURVETO);
         for v in [-20i32, 0] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RLINETO);
         expected.push(opcode::ENDCHAR);
@@ -546,10 +658,13 @@ mod tests {
     #[test]
     fn empty_glyph() {
         let pen = CharstringBuilder::new();
-        assert_eq!(pen.build(None, true), [opcode::ENDCHAR]);
+        assert_eq!(pen.build(None, true).unwrap().bytes, [opcode::ENDCHAR]);
         let pen = CharstringBuilder::new();
         // width 100 with nominal 0
-        assert_eq!(pen.build(Some(100), true), [0xef, opcode::ENDCHAR]);
+        assert_eq!(
+            pen.build(Some(100), true).unwrap().bytes,
+            [0xef, opcode::ENDCHAR]
+        );
     }
 
     #[test]
@@ -564,27 +679,27 @@ mod tests {
         pen.move_to(Point::new(0.0, 0.0));
         pen.line_to(Point::new(0.0, 50.0));
         pen.close_path();
-        let bytes = pen.build(None, false);
+        let bytes = pen.build(None, false).unwrap().bytes;
         let mut expected = Vec::new();
         for v in [10i32, 10] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RMOVETO);
         for v in [90i32, 0] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RLINETO);
         for v in [0i32, 90] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RLINETO);
         // moveto is relative to (100, 100), the last point drawn
         for v in [-100i32, -100] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RMOVETO);
         for v in [0i32, 50] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RLINETO);
         expected.push(opcode::ENDCHAR);
@@ -617,17 +732,155 @@ mod tests {
             pen.line_to(Point::new(*x as f64, *y as f64));
         }
         pen.close_path();
-        let bytes = pen.build(Some(57), true);
+        let bytes = pen.build(Some(57), true).unwrap().bytes;
         let mut expected = Vec::new();
         for v in [57i32, 242, 111] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::RMOVETO);
         for v in [72i32, 206, 199, 71, -199, 207, -72, -207, -199, -71, 199] {
-            encode_int(&mut expected, v);
+            encode_int(&mut expected, v).unwrap();
         }
         expected.push(opcode::HLINETO);
         expected.push(opcode::ENDCHAR);
         assert_eq!(bytes, expected);
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// When two curves can't merge, fontTools `continue`s, so `stackUse` keeps
+    /// the value from further right instead of dropping to the left operand's.
+    /// The stale (larger) value then refuses merges that a reset one would
+    /// allow, which is visible here as two vvcurveto groups where a naive port
+    /// emits one.
+    #[test]
+    fn stale_stack_use_splits_vvcurveto() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.curve_to(
+            Point::new(10.0, 20.0),
+            Point::new(40.0, 60.0),
+            Point::new(40.0, 110.0),
+        );
+        pen.curve_to(
+            Point::new(40.0, 120.0),
+            Point::new(60.0, 150.0),
+            Point::new(60.0, 190.0),
+        );
+        let (mut x, mut y) = (60.0, 190.0);
+        for _ in 0..11 {
+            pen.curve_to(
+                Point::new(x + 30.0, y),
+                Point::new(x + 60.0, y + 10.0),
+                Point::new(x + 90.0, y + 10.0),
+            );
+            x += 90.0;
+            y += 10.0;
+        }
+        pen.close_path();
+
+        // fontTools T2CharStringPen(None, None).getCharString(optimize=True):
+        // [0 hmoveto | 10 20 30 40 50 vvcurveto | 10 20 30 40 vvcurveto
+        //  | 30 30 10 30 (x11) hhcurveto | endchar]
+        assert_eq!(
+            hex(&pen.build(None, true).unwrap().bytes),
+            "8b16959fa9b3bd1a959fa9b31aa9a995a9a9a995a9a9a995a9a9a995a9a9a995\
+             a9a9a995a9a9a995a9a9a995a9a9a995a9a9a995a9a9a995a91b0e"
+        );
+    }
+
+    /// Bounds describe the program, not the source outline: specialization
+    /// merged the stray point's moveto into the next one, so fontTools'
+    /// `calcBounds` never sees (100, 100).
+    #[test]
+    fn bounds_exclude_a_merged_away_stray_point() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(100.0, 100.0));
+        pen.close_path();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.line_to(Point::new(50.0, 0.0));
+        pen.line_to(Point::new(50.0, 50.0));
+        pen.close_path();
+        let cs = pen.build(None, true).unwrap();
+        assert_eq!(hex(&cs.bytes), "8b16bdbd060e");
+        assert_eq!(cs.bounds, Some(Rect::new(0.0, 0.0, 50.0, 50.0)));
+    }
+
+    /// Two collinear hlinetos merge into their sum, taking the turning point
+    /// (and with it the outline's x_max) out of the program.
+    #[test]
+    fn bounds_exclude_a_merged_away_backtrack() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.line_to(Point::new(100.0, 0.0));
+        pen.line_to(Point::new(-20.0, 0.0));
+        pen.close_path();
+        let cs = pen.build(None, true).unwrap();
+        assert_eq!(hex(&cs.bytes), "8b1677060e");
+        assert_eq!(cs.bounds, Some(Rect::new(-20.0, 0.0, 0.0, 0.0)));
+    }
+
+    /// Curve bounds are exact, not control-point bounds: fontTools reports
+    /// y_max 75, not 100.
+    #[test]
+    fn bounds_use_curve_extrema() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.curve_to(
+            Point::new(10.0, 100.0),
+            Point::new(90.0, 100.0),
+            Point::new(100.0, 0.0),
+        );
+        pen.close_path();
+        let bounds = pen.build(None, true).unwrap().bounds.unwrap();
+        assert_eq!((bounds.x0, bounds.y0, bounds.x1), (0.0, 0.0, 100.0));
+        assert!((bounds.y1 - 75.0).abs() < 1e-9, "y1 = {}", bounds.y1);
+    }
+
+    /// A contour that is only a moveto still contributes its point.
+    #[test]
+    fn bounds_of_a_lone_point() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(30.0, -40.0));
+        pen.close_path();
+        let cs = pen.build(None, true).unwrap();
+        assert_eq!(cs.bounds, Some(Rect::new(30.0, -40.0, 30.0, -40.0)));
+        assert_eq!(
+            CharstringBuilder::new().build(None, true).unwrap().bounds,
+            None
+        );
+    }
+
+    /// The 2/3 rule applies to the unrounded points; rounding the quadratic
+    /// first and converting from the rounded current point would put the first
+    /// control point one unit off (-19 instead of -20 here).
+    #[test]
+    fn quadratic_conversion_rounds_once() {
+        let mut path = BezPath::new();
+        path.move_to(Point::new(-176.8, 3.0));
+        path.quad_to(Point::new(-185.0, -26.5), Point::new(-172.1, -163.7));
+        path.close_path();
+        let mut pen = CharstringBuilder::new();
+        pen.append_path(&path);
+        // fontTools: [-177, 3, 'rmoveto', -5, -20, 1, -55, 9, -92, 'rrcurveto']
+        assert_eq!(
+            hex(&pen.build(None, true).unwrap().bytes),
+            "fb458e1586778c54942f080e"
+        );
+    }
+
+    /// Type 2 has no integer operand wide enough for this; fontTools would
+    /// silently write a 16.16 fixed number.
+    #[test]
+    fn operand_out_of_range_is_an_error() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.line_to(Point::new(40000.0, 0.0));
+        assert_eq!(
+            pen.build(None, true),
+            Err(CffBuildError::OperandOutOfRange { value: 40000 })
+        );
     }
 }
