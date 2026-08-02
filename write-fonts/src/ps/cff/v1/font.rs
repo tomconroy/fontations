@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use font_types::Tag;
+use kurbo::Rect;
 use read_fonts::{ps::string::STANDARD_STRINGS, TopLevelTable};
 
 use super::{
@@ -131,13 +132,13 @@ pub struct GlyphData {
     /// [`CharstringBuilder::build`][super::charstring::CharstringBuilder::build]
     /// with `width: None`).
     pub charstring: Vec<u8>,
-    /// The charstring's bounds as `[x_min, y_min, x_max, y_max]`, each side
-    /// rounded with [`OtRound`] like ufo2ft; `None` for a glyph that draws
-    /// nothing (ufo2ft also treats an all-zero box as nothing).
+    /// The charstring's exact bounds, straight from
+    /// [`Charstring::bounds`][super::charstring::Charstring::bounds]; `None`
+    /// for a glyph that draws nothing.
     ///
-    /// [`Charstring::bounds`][super::charstring::Charstring::bounds] produces
-    /// the unrounded rectangle.
-    pub bounds: Option<[i32; 4]>,
+    /// Only the FontBBox is derived from this, and it is *not* rounded: see
+    /// [`CffFontBuilder::build`].
+    pub bounds: Option<Rect>,
 }
 
 /// An error produced when building a [`Cff`] table.
@@ -261,19 +262,7 @@ impl CffFontBuilder {
             weight: sid(&mut strings, &self.top_dict.weight)?,
         };
 
-        let font_bbox = self
-            .glyphs
-            .iter()
-            .filter_map(|g| g.bounds)
-            .reduce(|a, b| {
-                [
-                    a[0].min(b[0]),
-                    a[1].min(b[1]),
-                    a[2].max(b[2]),
-                    a[3].max(b[3]),
-                ]
-            })
-            .unwrap_or_default();
+        let font_bbox = font_bbox(&self.glyphs);
 
         // a charset the reader already knows needs no block of its own
         let predefined_charset = predefined_charset(&charset_sids);
@@ -691,6 +680,33 @@ fn compile_index(items: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+/// The FontBBox fontTools would compute for these glyphs.
+///
+/// fontTools recalculates the FontBBox whenever it compiles a CFF table
+/// (`CFFFontSet.compile` -> `TopDict.recalcFontBBox`), discarding whatever
+/// ufo2ft put there: it unions the *exact* charstring bounds and then grows
+/// the result outward to integers with `intRect`, flooring the minimums and
+/// ceiling the maximums. That is deliberately not the union of the rounded
+/// per-glyph boxes, which can be a unit smaller on each side.
+///
+/// With no bounded glyph at all fontTools falls back to the DICT default,
+/// which is all zeros.
+fn font_bbox(glyphs: &[GlyphData]) -> [i32; 4] {
+    glyphs
+        .iter()
+        .filter_map(|g| g.bounds)
+        .reduce(|a, b| a.union(b))
+        .map(|r| {
+            [
+                r.x0.floor() as i32,
+                r.y0.floor() as i32,
+                r.x1.ceil() as i32,
+                r.y1.ceil() as i32,
+            ]
+        })
+        .unwrap_or_default()
+}
+
 /// Port of fontTools' `cffLib.width.optimizeWidths`: pick the
 /// `(defaultWidthX, nominalWidthX)` pair minimizing total charstring width
 /// bytes. Linear in the width range + glyph count.
@@ -951,7 +967,7 @@ mod tests {
                 } else {
                     corner(size)
                 },
-                bounds: (size != 0.0).then_some([0, 0, size as i32, size as i32]),
+                bounds: (size != 0.0).then(|| Rect::new(0.0, 0.0, size, size)),
             });
         }
         let cff = builder.build().unwrap();
@@ -1078,6 +1094,37 @@ mod tests {
         0xf8, 0x88, 0x14, 0xf8, 0x88, 0x15,
     ];
 
+    /// fontTools grows the FontBBox outward to integers (`intRect`) from the
+    /// union of the *exact* charstring bounds, so a curve that overshoots its
+    /// on-curve points by a fraction of a unit widens the box by a whole unit
+    /// on that side. Rounding each glyph box first would lose that unit.
+    ///
+    /// The numbers are the ones AlefAlefAlef/GveretLevin exposed: fontc used
+    /// to write [-479, -418, 1131, 1217] where fontmake wrote
+    /// [-480, -418, 1132, 1218].
+    #[test]
+    fn font_bbox_encloses_unrounded_bounds() {
+        let glyph = |name: &str, bounds| GlyphData {
+            name: name.into(),
+            advance_width: 500.0,
+            charstring: Vec::new(),
+            bounds,
+        };
+        let glyphs = [
+            glyph(".notdef", Some(Rect::new(-479.36, -320.09, 232.81, 562.42))),
+            glyph("a", Some(Rect::new(-41.22, -418.0, 749.07, 1217.34))),
+            glyph("b", Some(Rect::new(-13.88, -26.58, 1131.11, 687.0))),
+            glyph("space", None),
+        ];
+        // mins floored and maxes ceiled, *not* each side rounded to nearest —
+        // that would give [-479, -418, 1131, 1217]
+        assert_eq!(font_bbox(&glyphs), [-480, -418, 1132, 1218]);
+        // an integral side stays put in both directions
+        assert_eq!(font_bbox(&glyphs)[1], -418);
+        // no bounded glyph at all: the DICT default
+        assert_eq!(font_bbox(&[glyph("space", None)]), [0, 0, 0, 0]);
+    }
+
     #[test]
     fn duck_matches_fontmake_bytes() {
         use super::super::charstring::CharstringBuilder;
@@ -1146,7 +1193,7 @@ mod tests {
                     (100.0, -150.0),
                 ],
             ]),
-            bounds: Some([50, -200, 450, 800]),
+            bounds: Some(Rect::new(50.0, -200.0, 450.0, 800.0)),
         });
         builder.add_glyph(GlyphData {
             name: "space".into(),
@@ -1163,7 +1210,7 @@ mod tests {
                 (295.0, 760.0),
                 (222.0, 760.0),
             ]),
-            bounds: Some([222, -241, 295, 760]),
+            bounds: Some(Rect::new(222.0, -241.0, 295.0, 760.0)),
         });
         builder.add_glyph(GlyphData {
             name: "plus".into(),
@@ -1182,7 +1229,7 @@ mod tests {
                 (43.0, 317.0),
                 (242.0, 317.0),
             ]),
-            bounds: Some([43, 111, 513, 595]),
+            bounds: Some(Rect::new(43.0, 111.0, 513.0, 595.0)),
         });
         builder.add_glyph(GlyphData {
             name: "element_of".into(),

@@ -10,7 +10,7 @@
 //! `cffLib.specializer.specializeCommands`, producing the same operator
 //! choices as fontmake/ufo2ft at CFF optimization level 1.
 
-use kurbo::{BezPath, CubicBez, ParamCurveExtrema, PathEl, Point, Rect, Vec2};
+use kurbo::{BezPath, PathEl, Point, Rect, Vec2};
 
 use super::CffBuildError;
 use crate::OtRound;
@@ -273,6 +273,62 @@ pub(super) fn encode_int(out: &mut Vec<u8>, value: i32) -> Result<(), CffBuildEr
 /// Bounds of the outline a command list draws, like fontTools' `BoundsPen`:
 /// curve-exact, and a moveto contributes its point even if nothing follows.
 ///
+/// Port of fontTools' `solveQuadratic`, whose `epsilon` and division order
+/// both show up in the roots.
+fn solve_quadratic(a: f64, b: f64, c: f64) -> impl Iterator<Item = f64> {
+    const EPSILON: f64 = 1e-10;
+    let roots = if a.abs() < EPSILON {
+        if b.abs() < EPSILON {
+            [None, None]
+        } else {
+            [Some(-c / b), None]
+        }
+    } else {
+        let dd = b * b - 4.0 * a * c;
+        if dd >= 0.0 {
+            let rdd = dd.sqrt();
+            [Some((-b + rdd) / 2.0 / a), Some((-b - rdd) / 2.0 / a)]
+        } else {
+            [None, None]
+        }
+    };
+    roots.into_iter().flatten()
+}
+
+/// Port of fontTools' `calcCubicBounds`.
+///
+/// Not [`kurbo::ParamCurveExtrema::bounding_box`]: the two agree on the maths
+/// but not on the last bit. fontTools works in the power basis, and evaluating
+/// `at³ + bt² + ct + d` is not the same sequence of roundings as evaluating
+/// the Bernstein form, so an extremum that is exactly on a grid line can come
+/// out a fraction beyond it — enough to change the `floor` the FontBBox takes.
+/// WireOne's `icircumflex` reaches exactly x = -75 that way.
+fn cubic_bounds(p0: Point, p1: Point, p2: Point, p3: Point) -> Rect {
+    // calcCubicParameters
+    let (dx, dy) = (p0.x, p0.y);
+    let cx = (p1.x - dx) * 3.0;
+    let cy = (p1.y - dy) * 3.0;
+    let bx = (p2.x - p1.x) * 3.0 - cx;
+    let by = (p2.y - p1.y) * 3.0 - cy;
+    let ax = p3.x - dx - cx - bx;
+    let ay = p3.y - dy - cy - by;
+
+    // roots of the first derivative, in each direction
+    let in_range = |t: &f64| (0.0..1.0).contains(t);
+    let roots = solve_quadratic(ax * 3.0, bx * 2.0, cx)
+        .filter(in_range)
+        .chain(solve_quadratic(ay * 3.0, by * 2.0, cy).filter(in_range));
+
+    let mut bounds = Rect::from_points(p0, p3);
+    for t in roots {
+        bounds = bounds.union_pt(Point::new(
+            ax * t * t * t + bx * t * t + cx * t + dx,
+            ay * t * t * t + by * t * t + cy * t + dy,
+        ));
+    }
+    bounds
+}
+
 /// Expects commands in the form specialization passes 1-3 leave them, where
 /// every command is still a single segment.
 fn command_bounds(commands: &[Command]) -> Option<Rect> {
@@ -303,10 +359,22 @@ fn command_bounds(commands: &[Command]) -> Option<Rect> {
                 let p1 = pos + d1;
                 let p2 = p1 + Vec2::new(args[used] as f64, args[used + 1] as f64);
                 let p3 = p2 + delta(*c1, &args[used + 2..]).0;
-                let curve = CubicBez::new(pos, p1, p2, p3).bounding_box();
-                bounds = Some(match bounds {
-                    Some(bounds) => bounds.union(curve),
-                    None => curve,
+                // fontTools' BoundsPen adds the endpoint, then measures the
+                // curve *only* when a control point escapes the bounds so far:
+                // a curve stays inside its control polygon, so contained
+                // controls cannot reach further. Skipping the measurement also
+                // skips its rounding error, which is why this is worth copying.
+                let so_far = match bounds {
+                    Some(bounds) => bounds.union_pt(p3),
+                    None => Rect::from_points(p3, p3),
+                };
+                let escapes = |p: Point| {
+                    !(so_far.x0 <= p.x && p.x <= so_far.x1 && so_far.y0 <= p.y && p.y <= so_far.y1)
+                };
+                bounds = Some(if escapes(p1) || escapes(p2) {
+                    so_far.union(cubic_bounds(pos, p1, p2, p3))
+                } else {
+                    so_far
                 });
                 pos = p3;
             }
@@ -837,6 +905,76 @@ mod tests {
         let bounds = pen.build(None, true).unwrap().bounds.unwrap();
         assert_eq!((bounds.x0, bounds.y0, bounds.x1), (0.0, 0.0, 100.0));
         assert!((bounds.y1 - 75.0).abs() < 1e-9, "y1 = {}", bounds.y1);
+    }
+
+    /// fontTools' `calcCubicBounds` examples, which its own docstring locks
+    /// down; ours has to agree to the bit, because the FontBBox floors these.
+    #[test]
+    fn cubic_bounds_match_fonttools() {
+        let bounds = |pts: [(f64, f64); 4]| {
+            let p: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
+            let r = cubic_bounds(p[0], p[1], p[2], p[3]);
+            (r.x0, r.y0, r.x1, r.y1)
+        };
+        assert_eq!(
+            bounds([(0.0, 0.0), (25.0, 100.0), (75.0, 100.0), (100.0, 0.0)]),
+            (0.0, 0.0, 100.0, 75.0)
+        );
+        assert_eq!(
+            bounds([(0.0, 0.0), (50.0, 0.0), (100.0, 50.0), (100.0, 100.0)]),
+            (0.0, 0.0, 100.0, 100.0)
+        );
+        let (x0, y0, x1, y1) = bounds([(50.0, 0.0), (0.0, 100.0), (100.0, 100.0), (50.0, 0.0)]);
+        assert_eq!(
+            (
+                format!("{x0:.6}"),
+                format!("{y0:.6}"),
+                format!("{x1:.6}"),
+                format!("{y1:.6}")
+            ),
+            (
+                "35.566243".into(),
+                "0.000000".into(),
+                "64.433757".into(),
+                "75.000000".into()
+            )
+        );
+    }
+
+    /// WireOne's `icircumflex` runs a curve down to exactly x = -75, an
+    /// on-curve endpoint. kurbo's `bounding_box` evaluates the Bernstein form
+    /// and lands on -75.00000000000001; the FontBBox floors that to -76 where
+    /// fontmake wrote -75. fontTools' power-basis evaluation hits -75 exactly.
+    #[test]
+    fn cubic_bounds_do_not_overshoot_an_exact_extreme() {
+        let pts = [
+            Point::new(-63.0, 596.0),
+            Point::new(-70.0, 595.0),
+            Point::new(-75.0, 589.0),
+            Point::new(-75.0, 583.0),
+        ];
+        assert_eq!(cubic_bounds(pts[0], pts[1], pts[2], pts[3]).x0, -75.0);
+    }
+
+    /// A curve whose control points are already inside the bounds is never
+    /// measured, which is both faster and (since measuring rounds) the only
+    /// way to reproduce fontTools' answer.
+    #[test]
+    fn a_contained_curve_does_not_widen_the_bounds() {
+        let mut pen = CharstringBuilder::new();
+        pen.move_to(Point::new(0.0, 0.0));
+        pen.line_to(Point::new(100.0, 0.0));
+        pen.line_to(Point::new(100.0, 100.0));
+        pen.line_to(Point::new(0.0, 100.0));
+        // controls well inside the square traced so far
+        pen.curve_to(
+            Point::new(10.0, 90.0),
+            Point::new(10.0, 10.0),
+            Point::new(0.0, 0.0),
+        );
+        pen.close_path();
+        let bounds = pen.build(None, true).unwrap().bounds.unwrap();
+        assert_eq!(bounds, Rect::new(0.0, 0.0, 100.0, 100.0));
     }
 
     /// A contour that is only a moveto still contributes its point.
