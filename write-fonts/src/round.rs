@@ -35,6 +35,13 @@ impl OtRound<u16> for f64 {
     }
 }
 
+impl OtRound<i32> for f64 {
+    #[inline]
+    fn ot_round(self) -> i32 {
+        (self + 0.5).floor() as i32
+    }
+}
+
 impl OtRound<u16> for f32 {
     #[inline]
     fn ot_round(self) -> u16 {

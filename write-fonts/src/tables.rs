@@ -35,6 +35,7 @@ pub mod varc;
 pub mod variations;
 pub mod vhea;
 pub mod vmtx;
+pub mod vorg;
 pub mod vvar;
 
 #[cfg(feature = "ift")]
@@ -73,6 +74,7 @@ fn do_we_even_serde() {
         stat: stat::Stat,
         vhea: vhea::Vhea,
         vmtx: vmtx::Vmtx,
+        vorg: vorg::Vorg,
         vvar: vvar::Vvar,
         ift: ift::Ift,
     }

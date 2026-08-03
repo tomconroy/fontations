@@ -12,6 +12,17 @@ include!("../../generated/generated_post.rs");
 pub struct PString(String);
 
 impl Post {
+    /// Construct a new version 3.0 table, which carries no glyph names.
+    ///
+    /// This is the format used for CFF-flavored fonts, where names live in
+    /// the CFF charset.
+    pub fn new_v3() -> Self {
+        Post {
+            version: Version16Dot16::VERSION_3_0,
+            ..Default::default()
+        }
+    }
+
     /// Construct a new version 2.0 table from a glyph order.
     pub fn new_v2<'a>(order: impl IntoIterator<Item = &'a str>) -> Self {
         let standard_glyphs = read_fonts::tables::post::DEFAULT_GLYPH_NAMES
