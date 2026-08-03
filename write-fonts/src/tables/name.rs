@@ -29,6 +29,14 @@ impl Name {
     }
 
     fn check_sorted_and_unique_name_records(&self, ctx: &mut ValidationCtx) {
+        // A `#[validate(..)]` attribute *replaces* the generated recursive
+        // validation for its field (see `font-codegen/src/fields.rs`), so this
+        // has to run the records' own validation itself. Without it
+        // `NameRecord::validate_string_data` never ran and an unencodable
+        // record reached `NameStringWriter::write_into`, which panicked with
+        // "unknown encoding" instead of failing validation.
+        self.name_record.validate_impl(ctx);
+
         //TODO: replace with `is_sorted` whenever oss_fuzz is using rustc >= 1.82
         if self
             .name_record
@@ -146,7 +154,12 @@ impl FontWrite for NameStringWriter<'_> {
                         .expect("invalid char for MacRoman")
                         .write_into(writer);
                 }
-                Encoding::Unknown => panic!("unknown encoding"),
+                // unreachable via `dump_table`, which validates first:
+                // `NameRecord::validate_string_data` rejects Unknown.
+                Encoding::Unknown => panic!(
+                    "unknown encoding: a name record with an unsupported \
+                     platform/encoding id pair reached the writer"
+                ),
             }
         }
     }
@@ -184,6 +197,36 @@ mod tests {
             name_id: NameId::new(name_id),
             string: name.to_string().into(),
         }
+    }
+
+    /// An unencodable name record fails validation instead of panicking.
+    ///
+    /// Mac platform (1) with a non-Roman encoding — here encoding 3, Korean —
+    /// is `Encoding::Unknown`, which we cannot write. `NameRecord` has always
+    /// reported that, but `Name`'s `#[validate(..)]` attribute on `name_record`
+    /// replaced the recursive validation, so nothing ever called it and the
+    /// record made it to the writer, which panicked. Reproduced by
+    /// `hyper-type/hahmlet`, whose source asks for `1 1 3 23` name records.
+    #[test]
+    fn unencodable_record_is_a_validation_error() {
+        let table = Name::new(vec![make_name_record(1, 3, 23, 1, "함렡 Regular")]);
+        let err = crate::dump_table(&table).expect_err("should not be writable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unhandled platform/encoding id pair: (1, 3)"),
+            "{msg}"
+        );
+    }
+
+    /// The same field's sorted/unique checks still run.
+    #[test]
+    fn unsorted_records_are_still_a_validation_error() {
+        let table = Name::new(vec![
+            make_name_record(3, 1, 0x409, 2, "Regular"),
+            make_name_record(3, 1, 0x409, 1, "Family"),
+        ]);
+        let err = crate::dump_table(&table).expect_err("should not be writable");
+        assert!(err.to_string().contains("must be sorted"), "{err}");
     }
 
     #[test]
