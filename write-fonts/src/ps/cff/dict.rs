@@ -57,6 +57,15 @@ impl Operator {
     pub const NOMINAL_WIDTH_X: Operator = Operator(21);
     pub const SUBRS: Operator = Operator(19);
 
+    // CFF2 operators. `FDArray`/`FDSelect` exist in CFF1 too, but only for
+    // CID-keyed fonts, which this crate does not write.
+    pub const MAXSTACK: Operator = Operator(25);
+    pub const FD_ARRAY: Operator = Operator(0x0c24);
+    pub const FD_SELECT: Operator = Operator(0x0c25);
+    pub const VS_INDEX: Operator = Operator(22);
+    pub const BLEND: Operator = Operator(23);
+    pub const VSTORE: Operator = Operator(24);
+
     pub fn write(self, out: &mut Vec<u8>) {
         if self.0 & 0x0c00 == 0x0c00 {
             out.push(12);
@@ -83,6 +92,43 @@ impl Number {
         match self {
             Number::Int(v) => encode_int(out, v),
             Number::Real(v) => encode_real(out, v),
+        }
+    }
+
+    /// The value as a float, whichever form it is stored in.
+    pub fn to_f64(self) -> f64 {
+        match self {
+            Number::Int(v) => v as f64,
+            Number::Real(v) => v,
+        }
+    }
+
+    /// Choose a form for `value` the way varLib's `conv_to_int` does: a value
+    /// that is mathematically an integer becomes an integer operand, and
+    /// everything else a real.
+    ///
+    /// varLib applies this to every blended Private DICT value before
+    /// handing it to `cffLib`, which then picks the encoding by Python type
+    /// (`fontTools/varLib/cff.py:60-63`, `cffLib/__init__.py:2337-2341`).
+    pub fn conv_to_int(value: f64) -> Number {
+        // matches Python `float.is_integer()`: infinities and NaN are not
+        if value.fract() == 0.0
+            && value.is_finite()
+            && (i32::MIN as f64..=i32::MAX as f64).contains(&value)
+        {
+            Number::Int(value as i32)
+        } else {
+            Number::Real(value)
+        }
+    }
+
+    /// `self - other`, choosing the result's form the way Python does: the
+    /// difference of two integers is an integer, and anything involving a
+    /// float is a float (and so encodes as a real, even when integral).
+    pub(crate) fn sub(self, other: Number) -> Number {
+        match (self, other) {
+            (Number::Int(a), Number::Int(b)) => Number::Int(a - b),
+            (a, b) => Number::Real(a.to_f64() - b.to_f64()),
         }
     }
 }
@@ -206,6 +252,20 @@ pub fn encode_real(out: &mut Vec<u8>, value: f64) {
     }
 }
 
+/// The value a real operand comes back as once it has been through the DICT
+/// encoder and read again.
+///
+/// A DICT real keeps only eight significant digits, so this is lossy — and
+/// the loss is observable. varLib blends a CFF2 Private DICT against the
+/// *default* master's `CFF ` table, which `convertCFFToCFF2` has already
+/// re-read from bytes, while the region masters' values are whatever ufo2ft
+/// computed; a caller reproducing those blends has to quantize the default
+/// master's values the same way or it will find them equal when fontTools
+/// finds a delta.
+pub fn round_trip_real(value: f64) -> f64 {
+    format_g8(value).parse().unwrap_or(value)
+}
+
 /// Format like C's `"%.8G"`: 8 significant digits, scientific notation when
 /// the decimal exponent is < -4 or >= 8, trailing zeros removed.
 fn format_g8(value: f64) -> String {
@@ -245,6 +305,22 @@ pub fn encode_delta(out: &mut Vec<u8>, values: &[i32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cormorant's `BlueScale`: ufo2ft computes 3/(4*19), but the default
+    /// master's copy has been through the encoder, and the difference is
+    /// exactly the delta fontmake writes into the blended Private DICT
+    /// (`<blend value="0.039473684 2.1052631e-10"/>`).
+    #[test]
+    fn a_real_loses_everything_past_eight_digits() {
+        let exact = 3.0 / (4.0 * 19.0);
+        assert_eq!(exact, 0.039473684210526314);
+        assert_eq!(round_trip_real(exact), 0.039473684);
+        assert_eq!(exact - round_trip_real(exact), 2.1052631166140756e-10);
+        // an integral value, and one that needs the exponent form, survive
+        assert_eq!(round_trip_real(0.06), 0.06);
+        assert_eq!(round_trip_real(-12.0), -12.0);
+        assert_eq!(round_trip_real(1.5e-9), 1.5e-9);
+    }
 
     fn int_bytes(v: i32) -> Vec<u8> {
         let mut out = Vec::new();

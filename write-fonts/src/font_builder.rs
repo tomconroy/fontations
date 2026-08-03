@@ -370,4 +370,29 @@ mod tests {
 
         assert_eq!(builder.ordered_tags(), expected);
     }
+
+    /// A `CFF2` font takes the *TTF* table order, not the CFF one, because
+    /// fontTools' `sortedTagList` keys off `"CFF " in tagList` and nothing
+    /// else. Measured on `fontmake -o variable-cff2` output: `cmap` comes
+    /// before `name`, which is the TTF order (the CFF order has them the
+    /// other way round). It is still an `OTTO` font, which
+    /// `TableDirectory::from_table_records` already gets right.
+    #[test]
+    fn cff2_keeps_the_ttf_table_order() {
+        let mut builder = FontBuilder::default();
+        for tag in [b"name", b"CFF2", b"cmap", b"head"] {
+            builder.add_raw(Tag::new(tag), vec![0]);
+        }
+        assert_eq!(
+            builder.ordered_tags(),
+            [
+                Tag::new(b"head"),
+                Tag::new(b"cmap"),
+                Tag::new(b"name"),
+                Tag::new(b"CFF2"),
+            ]
+        );
+        let font = builder.build();
+        assert_eq!(&font[..4], b"OTTO");
+    }
 }

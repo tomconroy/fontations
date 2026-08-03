@@ -2,8 +2,26 @@
 
 include!("../../../generated/generated_cff2.rs");
 
+pub mod charstring;
+pub mod dict;
+pub mod font;
+pub mod varstore;
+
+pub use charstring::{Cff2Charstring, Cff2CharstringBuilder};
+pub use dict::Blend;
+pub use font::{Cff2, Cff2FontBuilder, Cff2GlyphData, Cff2PrivateDictValues, Cff2TopDictValues};
+
 impl Index {
     /// Construct an `Index` from a list of byte items.
+    ///
+    /// Note that an empty INDEX comes out as six bytes (a zero count, an
+    /// offset size and one offset) rather than the bare four-byte zero count
+    /// the CFF2 spec calls for, because this type always writes `off_size`
+    /// and `offsets`. A `CFF2` table cannot use that form — everything after
+    /// an empty INDEX would be two bytes out — so the table writer emits
+    /// INDEXes with [`crate::ps::cff::index::write_index_to`] instead, and
+    /// this constructor is only for INDEXes that stand alone in their own
+    /// subtable, like `VARC`'s.
     pub fn from_items(items: Vec<Vec<u8>>) -> Self {
         if items.is_empty() {
             return Index::new(0, 1, vec![1], vec![]);
