@@ -252,6 +252,20 @@ pub fn encode_real(out: &mut Vec<u8>, value: f64) {
     }
 }
 
+/// The value a real operand comes back as once it has been through the DICT
+/// encoder and read again.
+///
+/// A DICT real keeps only eight significant digits, so this is lossy — and
+/// the loss is observable. varLib blends a CFF2 Private DICT against the
+/// *default* master's `CFF ` table, which `convertCFFToCFF2` has already
+/// re-read from bytes, while the region masters' values are whatever ufo2ft
+/// computed; a caller reproducing those blends has to quantize the default
+/// master's values the same way or it will find them equal when fontTools
+/// finds a delta.
+pub fn round_trip_real(value: f64) -> f64 {
+    format_g8(value).parse().unwrap_or(value)
+}
+
 /// Format like C's `"%.8G"`: 8 significant digits, scientific notation when
 /// the decimal exponent is < -4 or >= 8, trailing zeros removed.
 fn format_g8(value: f64) -> String {
@@ -291,6 +305,22 @@ pub fn encode_delta(out: &mut Vec<u8>, values: &[i32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cormorant's `BlueScale`: ufo2ft computes 3/(4*19), but the default
+    /// master's copy has been through the encoder, and the difference is
+    /// exactly the delta fontmake writes into the blended Private DICT
+    /// (`<blend value="0.039473684 2.1052631e-10"/>`).
+    #[test]
+    fn a_real_loses_everything_past_eight_digits() {
+        let exact = 3.0 / (4.0 * 19.0);
+        assert_eq!(exact, 0.039473684210526314);
+        assert_eq!(round_trip_real(exact), 0.039473684);
+        assert_eq!(exact - round_trip_real(exact), 2.1052631166140756e-10);
+        // an integral value, and one that needs the exponent form, survive
+        assert_eq!(round_trip_real(0.06), 0.06);
+        assert_eq!(round_trip_real(-12.0), -12.0);
+        assert_eq!(round_trip_real(1.5e-9), 1.5e-9);
+    }
 
     fn int_bytes(v: i32) -> Vec<u8> {
         let mut out = Vec::new();
