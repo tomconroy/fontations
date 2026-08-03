@@ -13,10 +13,13 @@
 use kurbo::{BezPath, PathEl, Point, Rect, Vec2};
 
 use super::CffBuildError;
-use crate::OtRound;
+use crate::{
+    ps::cff::charstring::{args_stack_use, encode_int, Arg, MAX_STACK_CFF1},
+    OtRound,
+};
 
 /// Type 2 charstring operators (single byte).
-mod opcode {
+pub(crate) mod opcode {
     pub const VMOVETO: u8 = 4;
     pub const RLINETO: u8 = 5;
     pub const HLINETO: u8 = 6;
@@ -33,15 +36,12 @@ mod opcode {
     pub const HVCURVETO: u8 = 31;
 }
 
-/// The maximum argument stack depth of a Type 2 charstring interpreter.
-const MAX_STACK: usize = 48;
-
 /// Direction category of a delta vector, after fontTools' specializer.
 ///
 /// `Zero` is fontTools' made-up `'0'` category (both components zero),
 /// resolved to `H` at the end of specialization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Cat {
+pub(crate) enum Cat {
     Zero,
     H,
     V,
@@ -69,7 +69,7 @@ impl Cat {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Op {
+pub(crate) enum Op {
     Move(Cat),
     Line(Cat),
     Curve(Cat, Cat),
@@ -79,17 +79,18 @@ enum Op {
     LineCurve,
 }
 
-type Command = (Op, Vec<i32>);
+pub(crate) type Command = (Op, Vec<Arg>);
 
 /// Categorize a delta vector, keeping only the args the category implies.
 ///
-/// Like fontTools, the `Zero` category keeps a single `0` argument.
-fn categorize(dx: i32, dy: i32) -> (Cat, Vec<i32>) {
-    match (dx, dy) {
-        (0, 0) => (Cat::Zero, vec![0]),
-        (0, dy) => (Cat::V, vec![dy]),
-        (dx, 0) => (Cat::H, vec![dx]),
-        (dx, dy) => (Cat::R, vec![dx, dy]),
+/// Like fontTools' `_categorizeVector`, the `Zero` category keeps the
+/// x argument. A blended argument is never zero (see [`Arg::is_zero`]).
+pub(crate) fn categorize(dx: Arg, dy: Arg) -> (Cat, Vec<Arg>) {
+    match (dx.is_zero(), dy.is_zero()) {
+        (true, true) => (Cat::Zero, vec![dx]),
+        (true, false) => (Cat::V, vec![dy]),
+        (false, true) => (Cat::H, vec![dx]),
+        (false, false) => (Cat::R, vec![dx, dy]),
     }
 }
 
@@ -138,12 +139,14 @@ impl CharstringBuilder {
 
     pub fn move_to(&mut self, pt: Point) {
         let (dx, dy) = self.delta_to(pt);
-        self.commands.push((Op::Move(Cat::R), vec![dx, dy]));
+        self.commands
+            .push((Op::Move(Cat::R), vec![Arg::Scalar(dx), Arg::Scalar(dy)]));
     }
 
     pub fn line_to(&mut self, pt: Point) {
         let (dx, dy) = self.delta_to(pt);
-        self.commands.push((Op::Line(Cat::R), vec![dx, dy]));
+        self.commands
+            .push((Op::Line(Cat::R), vec![Arg::Scalar(dx), Arg::Scalar(dy)]));
     }
 
     pub fn curve_to(&mut self, p1: Point, p2: Point, p3: Point) {
@@ -152,7 +155,10 @@ impl CharstringBuilder {
         let (dx3, dy3) = self.delta_to(p3);
         self.commands.push((
             Op::Curve(Cat::R, Cat::R),
-            vec![dx1, dy1, dx2, dy2, dx3, dy3],
+            [dx1, dy1, dx2, dy2, dx3, dy3]
+                .into_iter()
+                .map(Arg::Scalar)
+                .collect(),
         ));
     }
 
@@ -204,7 +210,7 @@ impl CharstringBuilder {
         };
         let bounds = command_bounds(&commands);
         let commands = if specialize {
-            specialize_encoding(commands)
+            specialize_encoding(commands, MAX_STACK_CFF1)
         } else {
             commands
         };
@@ -215,7 +221,12 @@ impl CharstringBuilder {
         }
         for (op, args) in &commands {
             for arg in args {
-                encode_int(&mut bytes, *arg)?;
+                match arg {
+                    Arg::Scalar(value) => encode_int(&mut bytes, *value)?,
+                    // the pen only ever makes scalars; blends arrive through
+                    // the CFF2 builder, which has its own encoder
+                    Arg::Blend { .. } => unreachable!("a CFF1 charstring cannot blend"),
+                }
             }
             bytes.push(operator_byte(op));
         }
@@ -224,7 +235,7 @@ impl CharstringBuilder {
     }
 }
 
-fn operator_byte(op: &Op) -> u8 {
+pub(crate) fn operator_byte(op: &Op) -> u8 {
     match op {
         Op::Move(Cat::R) => opcode::RMOVETO,
         Op::Move(Cat::H) => opcode::HMOVETO,
@@ -241,33 +252,6 @@ fn operator_byte(op: &Op) -> u8 {
         Op::LineCurve => opcode::RLINECURVE,
         _ => unreachable!("unresolved pseudo-operator {op:?}"),
     }
-}
-
-/// Encode a Type 2 charstring integer operand.
-///
-/// Unlike DICT integers there is no 5-byte integer form; a value outside the
-/// i16 range cannot be represented. (fontTools emits the 16.16 fixed form for
-/// these, which silently mangles the value, so we report an error instead.)
-pub(super) fn encode_int(out: &mut Vec<u8>, value: i32) -> Result<(), CffBuildError> {
-    match value {
-        -107..=107 => out.push((value + 139) as u8),
-        108..=1131 => {
-            let v = value - 108;
-            out.push(((v >> 8) + 247) as u8);
-            out.push((v & 0xff) as u8);
-        }
-        -1131..=-108 => {
-            let v = -value - 108;
-            out.push(((v >> 8) + 251) as u8);
-            out.push((v & 0xff) as u8);
-        }
-        -32768..=32767 => {
-            out.push(28);
-            out.extend_from_slice(&(value as i16).to_be_bytes());
-        }
-        _ => return Err(CffBuildError::OperandOutOfRange { value }),
-    }
-    Ok(())
 }
 
 /// Bounds of the outline a command list draws, like fontTools' `BoundsPen`:
@@ -331,15 +315,17 @@ fn cubic_bounds(p0: Point, p1: Point, p2: Point, p3: Point) -> Rect {
 
 /// Expects commands in the form specialization passes 1-3 leave them, where
 /// every command is still a single segment.
-fn command_bounds(commands: &[Command]) -> Option<Rect> {
+pub(crate) fn command_bounds(commands: &[Command]) -> Option<Rect> {
     /// The delta a category-reduced argument list encodes, and how many
     /// arguments it consumed.
-    fn delta(cat: Cat, args: &[i32]) -> (Vec2, usize) {
+    fn delta(cat: Cat, args: &[Arg]) -> (Vec2, usize) {
+        // the default master's values are what the outline is measured from
+        let value = |arg: &Arg| arg.default_value() as f64;
         match cat {
             Cat::Zero => (Vec2::ZERO, 1),
-            Cat::H => (Vec2::new(args[0] as f64, 0.0), 1),
-            Cat::V => (Vec2::new(0.0, args[0] as f64), 1),
-            Cat::R => (Vec2::new(args[0] as f64, args[1] as f64), 2),
+            Cat::H => (Vec2::new(value(&args[0]), 0.0), 1),
+            Cat::V => (Vec2::new(0.0, value(&args[0])), 1),
+            Cat::R => (Vec2::new(value(&args[0]), value(&args[1])), 2),
         }
     }
 
@@ -357,7 +343,11 @@ fn command_bounds(commands: &[Command]) -> Option<Rect> {
             Op::Curve(c0, c1) => {
                 let (d1, used) = delta(*c0, args);
                 let p1 = pos + d1;
-                let p2 = p1 + Vec2::new(args[used] as f64, args[used + 1] as f64);
+                let p2 = p1
+                    + Vec2::new(
+                        args[used].default_value() as f64,
+                        args[used + 1].default_value() as f64,
+                    );
                 let p3 = p2 + delta(*c1, &args[used + 2..]).0;
                 // fontTools' BoundsPen adds the endpoint, then measures the
                 // curve *only* when a control point escapes the bounds so far:
@@ -399,19 +389,29 @@ enum Merge {
 }
 
 /// Passes 1-3 of fontTools `cffLib.specializer.specializeCommands` (with
-/// `generalizeFirst=False, preserveTopology=False, maxstack=48`), operating
-/// on generalized integer commands.
+/// `generalizeFirst=False, preserveTopology=False`), operating on generalized
+/// commands.
 ///
-/// These are the passes that change which points the outline contains.
-fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
+/// These are the passes that change which points the outline contains. They
+/// are shared with CFF2, whose arguments may blend: a blended argument is
+/// never zero, and two of them only combine when they blend over the same
+/// regions.
+pub(crate) fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
     // 1. Combine successive rmoveto operations.
     let mut i = commands.len().saturating_sub(1);
     while i > 0 {
         if matches!(commands[i].0, Op::Move(Cat::R)) && commands[i].0 == commands[i - 1].0 {
             let (_, cur) = commands.remove(i);
             let prev = &mut commands[i - 1].1;
-            prev[0] += cur[0];
-            prev[1] += cur[1];
+            // fontTools does not guard this one (specializer.py:578-586):
+            // two movetos of the same glyph always blend over the same
+            // regions, so a mismatch means the caller built them wrong
+            let add = |a: &Arg, b: &Arg| {
+                a.add(b)
+                    .expect("blended movetos must agree on region count")
+            };
+            prev[0] = add(&prev[0], &cur[0]);
+            prev[1] = add(&prev[1], &cur[1]);
         }
         i -= 1;
     }
@@ -420,7 +420,7 @@ fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
     for (op, args) in commands.iter_mut() {
         match op {
             Op::Move(Cat::R) | Op::Line(Cat::R) => {
-                let (cat, new_args) = categorize(args[0], args[1]);
+                let (cat, new_args) = categorize(args[0].clone(), args[1].clone());
                 match op {
                     Op::Move(_) => *op = Op::Move(cat),
                     _ => *op = Op::Line(cat),
@@ -428,8 +428,8 @@ fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
                 *args = new_args;
             }
             Op::Curve(Cat::R, Cat::R) => {
-                let (c1, mut args1) = categorize(args[0], args[1]);
-                let (c2, args2) = categorize(args[4], args[5]);
+                let (c1, mut args1) = categorize(args[0].clone(), args[1].clone());
+                let (c2, args2) = categorize(args[4].clone(), args[5].clone());
                 args1.extend_from_slice(&args[2..4]);
                 args1.extend_from_slice(&args2);
                 *op = Op::Curve(c1, c2);
@@ -446,7 +446,7 @@ fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
         // A 00curveto is demoted to a (specialized) lineto.
         if commands[i].0 == Op::Curve(Cat::Zero, Cat::Zero) {
             debug_assert_eq!(commands[i].1.len(), 4);
-            let (cat, args) = categorize(commands[i].1[1], commands[i].1[2]);
+            let (cat, args) = categorize(commands[i].1[1].clone(), commands[i].1[2].clone());
             commands[i] = (Op::Line(cat), args);
         }
         // A 0lineto can be deleted.
@@ -459,8 +459,13 @@ fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
             && matches!(commands[i].0, Op::Line(Cat::H) | Op::Line(Cat::V))
             && commands[i].0 == commands[i - 1].0
         {
-            let (_, cur) = commands.remove(i);
-            commands[i - 1].1[0] += cur[0];
+            // blends over different regions cannot merge; fontTools catches
+            // the ValueError and leaves both commands standing
+            let Some(sum) = commands[i].1[0].add(&commands[i - 1].1[0]) else {
+                continue;
+            };
+            commands.remove(i);
+            commands[i - 1].1[0] = sum;
         }
     }
 
@@ -469,7 +474,7 @@ fn specialize_geometry(mut commands: Vec<Command>) -> Vec<Command> {
 
 /// Passes 4-6 of fontTools' `specializeCommands`: they pick operators and
 /// argument layouts for an outline that is already final.
-fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
+pub(crate) fn specialize_encoding(mut commands: Vec<Command>, max_stack: usize) -> Vec<Command> {
     // 4. Peephole: revert h/v variants between r-variants if that saves a byte.
     if commands.len() > 2 {
         for i in 1..commands.len() - 1 {
@@ -482,9 +487,9 @@ fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
                 {
                     debug_assert_eq!(args.len(), 1);
                     let new_args = if *cat == Cat::V {
-                        vec![0, args[0]]
+                        vec![Arg::Scalar(0), args[0].clone()]
                     } else {
-                        vec![args[0], 0]
+                        vec![args[0].clone(), Arg::Scalar(0)]
                     };
                     commands[i] = (Op::Line(Cat::R), new_args);
                 }
@@ -504,7 +509,7 @@ fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
                         5
                     };
                     let mut new_args = args.clone();
-                    new_args.insert(pos, 0);
+                    new_args.insert(pos, Arg::Scalar(0));
                     commands[i] = (Op::Curve(Cat::R, Cat::R), new_args);
                 }
                 _ => (),
@@ -513,7 +518,10 @@ fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
     }
 
     // 5. Combine adjacent operators, minding the max stack size.
-    let mut stack_use = commands.last().map(|(_, args)| args.len()).unwrap_or(0);
+    let mut stack_use = commands
+        .last()
+        .map(|(_, args)| args_stack_use(args))
+        .unwrap_or(0);
     let mut i = commands.len();
     while i > 1 {
         i -= 1;
@@ -568,10 +576,12 @@ fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
             Merge::Into(op) => Some(op),
         };
 
-        let args1_stack_use = commands[i - 1].1.len();
+        // a blend costs its whole operand list while it is on the stack,
+        // but the length of the argument list is still the logical count
+        let args1_stack_use = args_stack_use(&commands[i - 1].1);
         let combined_stack_use = args1_stack_use.max(commands[i - 1].1.len() + stack_use);
         // Keep strictly below the limit so a subroutinizer can insert calls.
-        if let Some(new_op) = new_op.filter(|_| combined_stack_use < MAX_STACK) {
+        if let Some(new_op) = new_op.filter(|_| combined_stack_use < max_stack) {
             let (_, args2) = commands.remove(i);
             let entry = &mut commands[i - 1];
             entry.0 = new_op;
@@ -639,6 +649,8 @@ fn specialize_encoding(mut commands: Vec<Command>) -> Vec<Command> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ps::cff::charstring::MAX_STACK_CFF2;
+
     use super::*;
 
     fn rect_pen(width: Option<i32>, specialize: bool) -> Vec<u8> {
@@ -1006,6 +1018,82 @@ mod tests {
         assert_eq!(
             hex(&pen.build(None, true).unwrap().bytes),
             "fb458e1586778c54942f080e"
+        );
+    }
+
+    fn blend(default: i32, deltas: &[f64]) -> Arg {
+        Arg::Blend {
+            default,
+            deltas: deltas.to_vec(),
+        }
+    }
+
+    /// A blended argument is never the "both components zero" category, even
+    /// when its default value is zero, so the moveto still specializes.
+    ///
+    /// fontTools: `specializeCommands([("rmoveto", [[0, 11, 1], 0])], …)`
+    /// gives `[('hmoveto', [[0, 11, 1]])]`.
+    #[test]
+    fn a_blended_zero_still_specializes() {
+        let commands = vec![(Op::Move(Cat::R), vec![blend(0, &[11.0]), Arg::Scalar(0)])];
+        assert_eq!(
+            specialize_geometry(commands),
+            vec![(Op::Move(Cat::H), vec![blend(0, &[11.0])])]
+        );
+    }
+
+    /// Collinear blended linetos merge elementwise, and refuse to merge when
+    /// they blend over different numbers of regions.
+    ///
+    /// fontTools: `[("rlineto", [[100,10,1], 0]), ("rlineto", [[50,5,1], 0])]`
+    /// gives `[('hlineto', [[150, 15, 1]])]`, while replacing the second
+    /// blend with `[50,5,6,1]` leaves two separate hlinetos.
+    #[test]
+    fn blended_lines_merge_elementwise() {
+        let line = |arg: Arg| (Op::Line(Cat::R), vec![arg, Arg::Scalar(0)]);
+        assert_eq!(
+            specialize_geometry(vec![line(blend(100, &[10.0])), line(blend(50, &[5.0]))]),
+            vec![(Op::Line(Cat::H), vec![blend(150, &[15.0])])]
+        );
+        assert_eq!(
+            specialize_geometry(vec![
+                line(blend(100, &[10.0])),
+                line(blend(50, &[5.0, 6.0]))
+            ]),
+            vec![
+                (Op::Line(Cat::H), vec![blend(100, &[10.0])]),
+                (Op::Line(Cat::H), vec![blend(50, &[5.0, 6.0])]),
+            ]
+        );
+    }
+
+    /// The operand stack limit is the caller's: CFF1 stops merging at 48
+    /// operands, CFF2 at 513.
+    ///
+    /// fontTools, on 60 alternating single-argument h/v linetos:
+    /// `maxstack=48` gives `hlineto` with 13 args then `vlineto` with 47,
+    /// `maxstack=513` gives one `hlineto` with all 60.
+    #[test]
+    fn the_stack_limit_is_the_callers() {
+        let commands: Vec<Command> = (0..60)
+            .map(|i| {
+                let op = if i % 2 == 0 { Cat::H } else { Cat::V };
+                (Op::Line(op), vec![Arg::Scalar(10)])
+            })
+            .collect();
+        let shape = |commands: Vec<Command>| -> Vec<(Op, usize)> {
+            commands
+                .into_iter()
+                .map(|(op, args)| (op, args.len()))
+                .collect()
+        };
+        assert_eq!(
+            shape(specialize_encoding(commands.clone(), MAX_STACK_CFF1)),
+            [(Op::Line(Cat::H), 13), (Op::Line(Cat::V), 47)]
+        );
+        assert_eq!(
+            shape(specialize_encoding(commands, MAX_STACK_CFF2)),
+            [(Op::Line(Cat::H), 60)]
         );
     }
 

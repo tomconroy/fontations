@@ -14,11 +14,13 @@ use font_types::Tag;
 use kurbo::Rect;
 use read_fonts::{ps::string::STANDARD_STRINGS, TopLevelTable};
 
-use super::{
-    charstring,
-    dict::{self, Operator},
-};
 use crate::{
+    ps::cff::{
+        charstring,
+        dict::{self, Operator},
+        index::{calc_off_size, compile_index, index_size, write_index_to, CountSize},
+        CffBuildError,
+    },
     validate::{Validate, ValidationCtx},
     write::{FontWrite, TableWriter},
     OtRound,
@@ -141,39 +143,6 @@ pub struct GlyphData {
     pub bounds: Option<Rect>,
 }
 
-/// An error produced when building a [`Cff`] table.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CffBuildError {
-    /// No glyphs were provided
-    NoGlyphs,
-    /// The first glyph must be named `.notdef`
-    FirstGlyphNotNotdef,
-    /// A charstring operand does not fit the Type 2 integer range
-    OperandOutOfRange { value: i32 },
-    /// More strings than the 16-bit SID space can identify
-    TooManyStrings,
-}
-
-impl std::fmt::Display for CffBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            CffBuildError::NoGlyphs => write!(f, "a CFF font requires at least one glyph"),
-            CffBuildError::FirstGlyphNotNotdef => {
-                write!(f, "the first glyph in a CFF font must be '.notdef'")
-            }
-            CffBuildError::OperandOutOfRange { value } => write!(
-                f,
-                "charstring operand {value} is outside the Type 2 integer range"
-            ),
-            CffBuildError::TooManyStrings => {
-                write!(f, "a CFF font cannot hold more than 65535 strings")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CffBuildError {}
-
 /// Builds a name-keyed CFF version 1 table.
 #[derive(Clone, Debug, Default)]
 pub struct CffFontBuilder {
@@ -270,17 +239,18 @@ impl CffFontBuilder {
             Some(_) => Vec::new(),
             None => compile_charset(&charset_sids),
         };
-        let charstrings_index = compile_index(&charstrings);
+        let charstrings_index = compile_index(&charstrings, CountSize::U16);
         let private_dict = compile_private_dict(&self.private, default_width, nominal_width);
 
         // fixed-size prefix: header, Name INDEX, String INDEX, GlobalSubrs
-        let name_index = compile_index(&[self.font_name.as_bytes().to_vec()]);
+        let name_index = compile_index(&[self.font_name.as_bytes().to_vec()], CountSize::U16);
         let string_index = compile_index(
             &strings
                 .strings
                 .iter()
                 .map(|s| s.as_bytes().to_vec())
                 .collect::<Vec<_>>(),
+            CountSize::U16,
         );
 
         // iterate until the offsets stored in the Top DICT stabilize, since
@@ -295,7 +265,7 @@ impl CffFontBuilder {
                 predefined_charset,
                 &offsets,
             );
-            let top_dict_index = index_size(&[top_dict_data.len()]);
+            let top_dict_index = index_size(&[top_dict_data.len()], CountSize::U16);
             let prefix_len = 4 + name_index.len() + top_dict_index + string_index.len() + 2;
             let new_offsets = TopDictOffsets {
                 charset: prefix_len,
@@ -313,7 +283,7 @@ impl CffFontBuilder {
         // header: major, minor, hdrSize, offSize for the whole table
         data.extend_from_slice(&[1, 0, 4, calc_off_size(total_size as u32)]);
         data.extend_from_slice(&name_index);
-        write_index_to(&mut data, &[top_dict_data]);
+        write_index_to(&mut data, &[top_dict_data], CountSize::U16);
         data.extend_from_slice(&string_index);
         data.extend_from_slice(&[0, 0]); // empty Global Subr INDEX
         debug_assert_eq!(data.len(), offsets.charset);
@@ -631,53 +601,6 @@ fn compile_charset(sids: &[u16]) -> Vec<u8> {
     } else {
         format0
     }
-}
-
-fn calc_off_size(value: u32) -> u8 {
-    match value {
-        0..=0xff => 1,
-        0x100..=0xffff => 2,
-        0x10000..=0xffffff => 3,
-        _ => 4,
-    }
-}
-
-/// The serialized size of an INDEX containing items of the given lengths.
-fn index_size(item_lens: &[usize]) -> usize {
-    if item_lens.is_empty() {
-        return 2;
-    }
-    let data_len: usize = item_lens.iter().sum();
-    let off_size = calc_off_size(data_len as u32 + 1) as usize;
-    2 + 1 + (item_lens.len() + 1) * off_size + data_len
-}
-
-fn write_index_to(out: &mut Vec<u8>, items: &[Vec<u8>]) {
-    out.extend_from_slice(&(items.len() as u16).to_be_bytes());
-    if items.is_empty() {
-        return;
-    }
-    let data_len: usize = items.iter().map(|i| i.len()).sum();
-    let off_size = calc_off_size(data_len as u32 + 1);
-    out.push(off_size);
-    let mut offset = 1u32;
-    let push_offset = |out: &mut Vec<u8>, offset: u32| {
-        out.extend_from_slice(&offset.to_be_bytes()[4 - off_size as usize..]);
-    };
-    push_offset(out, offset);
-    for item in items {
-        offset += item.len() as u32;
-        push_offset(out, offset);
-    }
-    for item in items {
-        out.extend_from_slice(item);
-    }
-}
-
-fn compile_index(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    write_index_to(&mut out, items);
-    out
 }
 
 /// The FontBBox fontTools would compute for these glyphs.
@@ -1033,9 +956,9 @@ mod tests {
 
     #[test]
     fn index_layout() {
-        assert_eq!(compile_index(&[]), [0, 0]);
+        assert_eq!(compile_index(&[], CountSize::U16), [0, 0]);
         assert_eq!(
-            compile_index(&[b"ab".to_vec(), b"c".to_vec()]),
+            compile_index(&[b"ab".to_vec(), b"c".to_vec()], CountSize::U16),
             [0, 2, 1, 1, 3, 4, b'a', b'b', b'c']
         );
     }
