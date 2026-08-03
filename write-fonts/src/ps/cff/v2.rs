@@ -2,7 +2,14 @@
 
 include!("../../../generated/generated_cff2.rs");
 
+pub mod charstring;
 pub mod dict;
+pub mod font;
+pub mod varstore;
+
+pub use charstring::{Cff2Charstring, Cff2CharstringBuilder};
+pub use dict::Blend;
+pub use font::{Cff2, Cff2FontBuilder, Cff2GlyphData, Cff2PrivateDictValues, Cff2TopDictValues};
 
 impl Index {
     /// Construct an `Index` from a list of byte items.
