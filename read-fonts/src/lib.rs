@@ -78,6 +78,8 @@ pub mod array;
 pub mod codegen_test;
 pub mod collections;
 mod font_data;
+pub mod limits;
+pub mod mem;
 pub mod model;
 mod offset;
 mod offset_array;

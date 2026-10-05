@@ -83,9 +83,7 @@ mod cff;
 mod glyf;
 mod hint;
 mod hint_reliant;
-mod memory;
 mod metrics;
-mod path;
 mod unscaled;
 mod varc;
 
@@ -105,10 +103,7 @@ use raw::FontRef;
 pub use {error::DrawError, pen::OutlinePen};
 
 use self::glyf::{FreeTypeScaler, HarfBuzzScaler};
-use super::{
-    instance::{LocationRef, NormalizedCoord, Size},
-    GLYF_COMPOSITE_RECURSION_LIMIT,
-};
+use super::instance::{LocationRef, NormalizedCoord, Size};
 use core::fmt::Debug;
 use pen::PathStyle;
 use read_fonts::{types::GlyphId, TableProvider};
@@ -766,7 +761,7 @@ pub(super) fn with_temporary_memory<R>(
         Some(buf) => f(buf),
         None => {
             let buf_size = outline.draw_memory_size(hinting);
-            memory::with_temporary_memory(buf_size, f)
+            read_fonts::mem::with_scratch(buf_size, f)
         }
     }
 }
@@ -776,7 +771,7 @@ mod tests {
     use super::*;
     use crate::{instance::Location, outline::pen::SvgPen, MetadataProvider};
     use kurbo::{Affine, BezPath, PathEl, Point};
-    use raw::model::pen::NullPen;
+    use raw::model::glyph::outline::NullPen;
     use read_fonts::{types::GlyphId, FontRef, TableProvider};
 
     use pretty_assertions::assert_eq;

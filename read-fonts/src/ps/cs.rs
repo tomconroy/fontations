@@ -1,7 +1,7 @@
 //! Parsing and evaluation of charstrings.
 
 use crate::{
-    model::pen::OutlinePen,
+    model::glyph::outline::OutlinePen,
     ps::{
         cff::{blend::BlendState, charset::Charset, index::Index, stack::Stack},
         error::Error,
@@ -10,7 +10,7 @@ use crate::{
         transform::{FontMatrix, Transform},
     },
     tables::cff::Cff,
-    types::{Fixed, Point},
+    types::{BoundingBox, Fixed, Point},
     Cursor, FontData, FontRead,
 };
 
@@ -146,6 +146,90 @@ pub trait CommandSink {
     fn finish(&mut self) {}
 }
 
+/// Sink that drops all drawing output into the ether.
+pub struct NullSink;
+
+impl CommandSink for NullSink {
+    fn move_to(&mut self, _x: Fixed, _y: Fixed) {}
+    fn line_to(&mut self, _x: Fixed, _y: Fixed) {}
+    fn curve_to(
+        &mut self,
+        _cx0: Fixed,
+        _cy0: Fixed,
+        _cx1: Fixed,
+        _cy1: Fixed,
+        _x: Fixed,
+        _y: Fixed,
+    ) {
+    }
+    fn close(&mut self) {}
+}
+
+/// Sink that measures the box a drawing stays within.
+///
+/// A curve counts through its control points rather than the path they
+/// describe, so one bulging inside its hull measures larger than it draws.
+/// That is a control box, which is what HarfBuzz reports for a charstring and
+/// what costs no arithmetic to find. Solving each curve would tighten the box
+/// and is not worth what it costs to a caller asking where a glyph roughly
+/// sits.
+///
+/// Nothing drawn leaves [`bounding_box`](Self::bounding_box) empty, which is
+/// the answer for a glyph with no ink rather than a box of no size at the
+/// origin. The pen that measures a drawn outline the same way is
+/// [`ControlBoundsPen`](crate::model::glyph::outline::ControlBoundsPen).
+#[derive(Clone, Default, Debug)]
+pub struct ControlBoundsSink {
+    bounds: Option<BoundingBox<Fixed>>,
+}
+
+impl ControlBoundsSink {
+    /// Creates a sink that has measured nothing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the bounding box collected by this sink.
+    pub fn bounding_box(&self) -> Option<BoundingBox<Fixed>> {
+        self.bounds
+    }
+
+    fn update_bounds(&mut self, x: Fixed, y: Fixed) {
+        self.bounds = Some(match self.bounds {
+            Some(b) => BoundingBox {
+                x_min: b.x_min.min(x),
+                y_min: b.y_min.min(y),
+                x_max: b.x_max.max(x),
+                y_max: b.y_max.max(y),
+            },
+            None => BoundingBox {
+                x_min: x,
+                y_min: y,
+                x_max: x,
+                y_max: y,
+            },
+        });
+    }
+}
+
+impl CommandSink for ControlBoundsSink {
+    fn move_to(&mut self, x: Fixed, y: Fixed) {
+        self.update_bounds(x, y);
+    }
+
+    fn line_to(&mut self, x: Fixed, y: Fixed) {
+        self.update_bounds(x, y);
+    }
+
+    fn curve_to(&mut self, cx0: Fixed, cy0: Fixed, cx1: Fixed, cy1: Fixed, x: Fixed, y: Fixed) {
+        self.update_bounds(cx0, cy0);
+        self.update_bounds(cx1, cy1);
+        self.update_bounds(x, y);
+    }
+
+    fn close(&mut self) {}
+}
+
 /// Evaluates the given charstring and emits the resulting commands to the
 /// specified sink.
 ///
@@ -169,6 +253,31 @@ pub fn evaluate<'a>(
     let width = evaluator.have_read_width.then_some(evaluator.wx);
     sink.finish();
     Ok(width)
+}
+
+/// Returns the advance width the charstring states, without drawing it.
+///
+/// A charstring states its width before it draws anything: Type 1 in the
+/// `hsbw` or `sbw` that must open it, Type 2 as an optional extra argument
+/// on the first operator that clears the stack. Evaluation therefore stops
+/// as soon as that operator has been seen, which for most glyphs is a
+/// handful of bytes out of hundreds.
+///
+/// `None` where the charstring states no width of its own. For Type 2 that
+/// is the common case and means the font's default width applies; the
+/// caller supplies it, since the charstring does not know it.
+pub fn evaluate_width<'a>(
+    context: &'a impl CharstringContext,
+    blend_state: Option<BlendState<'a>>,
+    charstring_data: &[u8],
+) -> Result<Option<Fixed>, Error> {
+    let mut sink = NullSink;
+    let mut evaluator = Evaluator::new(context, blend_state, &mut sink);
+    evaluator.width_only = true;
+    // A charstring that ends before saying anything is not an error; it
+    // simply states no width.
+    evaluator.evaluate(charstring_data)?;
+    Ok(evaluator.have_read_width.then_some(evaluator.wx))
 }
 
 /// Specifies how the seac operation was invoked.
@@ -195,6 +304,8 @@ struct Evaluator<'a, S> {
     is_flexing: bool,
     /// True if we've seen a command that might read width
     seen_width_command: bool,
+    /// Stop as soon as the width is settled, rather than drawing the glyph.
+    width_only: bool,
     /// True if we've actually read a width
     have_read_width: bool,
     stem_count: usize,
@@ -229,6 +340,7 @@ where
             is_open: false,
             is_flexing: false,
             seen_width_command: false,
+            width_only: false,
             have_read_width: false,
             stem_count: 0,
             stack: Stack::new(),
@@ -297,6 +409,12 @@ where
                     if let Some(operator) = Operator::read(&mut cursor, b0) {
                         seen_endchar |= operator == Operator::EndChar;
                         if !self.evaluate_operator(operator, &mut cursor, nesting_depth)? {
+                            break;
+                        }
+                        // The first stack-clearing operator settles the
+                        // width, whether or not it carried one, so there is
+                        // nothing further to learn from the rest.
+                        if self.width_only && self.seen_width_command {
                             break;
                         }
                     } else {
@@ -380,7 +498,7 @@ where
                     self.read_width()?;
                 }
                 self.seen_width_command = true;
-                if stack_len > 1 {
+                if stack_len > 1 && !self.width_only {
                     self.handle_seac(SeacMode::Implicit, nesting_depth)?;
                 }
                 return Ok(false);
@@ -662,7 +780,9 @@ where
             // Spec: <https://adobe-type-tools.github.io/font-tech-notes/pdfs/T1_SPEC.pdf#page=56>
             // FT: <https://gitlab.freedesktop.org/freetype/freetype/-/blob/80a507a6b8e3d2906ad2c8ba69329bd2fb2a85ef/src/psaux/psintrp.c#L1294>
             Seac => {
-                self.handle_seac(SeacMode::Explicit, nesting_depth)?;
+                if !self.width_only {
+                    self.handle_seac(SeacMode::Explicit, nesting_depth)?;
+                }
             }
             // Sets the left sidebearing point to (sbx, sby) and the character
             // width vector to (wx, wy) in character space. Also sets current
@@ -1110,6 +1230,7 @@ enum Operator {
 }
 
 impl Operator {
+    #[inline]
     fn read(cursor: &mut Cursor, b0: u8) -> Option<Self> {
         // Escape opcode for accessing two byte operators
         const ESCAPE: u8 = 12;

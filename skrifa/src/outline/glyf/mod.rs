@@ -12,9 +12,9 @@ pub use hint::{HintError, HintInstance, HintOutline};
 pub use outline::{Outline, ScaledOutline};
 
 use super::{DrawError, GlyphHMetrics, Hinting};
-use crate::{GLYF_COMPOSITE_RECURSION_LIMIT, MAX_GLYF_POINTS, MAX_GRAPH_EDGES};
 use memory::{FreeTypeOutlineMemory, HarfBuzzOutlineMemory};
 use raw::FontRef;
+use read_fonts::limits::{MAX_COMPOSITE_EDGES, MAX_OUTLINE_POINTS, MAX_RECURSION_DEPTH};
 use read_fonts::{
     tables::{
         glyf::{
@@ -143,6 +143,13 @@ impl<'a> Outlines<'a> {
         self.glyph_count as usize
     }
 
+    pub(crate) fn variation_axis_count(&self) -> usize {
+        self.gvar
+            .as_ref()
+            .map(|gvar| gvar.axis_count() as usize)
+            .unwrap_or_default()
+    }
+
     pub fn prefer_interpreter(&self) -> bool {
         self.prefer_interpreter
     }
@@ -196,7 +203,7 @@ impl Outlines<'_> {
         recurse_depth: usize,
         total_components: &mut usize,
     ) -> Result<(), DrawError> {
-        if recurse_depth > GLYF_COMPOSITE_RECURSION_LIMIT {
+        if recurse_depth > MAX_RECURSION_DEPTH {
             return Err(DrawError::RecursionLimitExceeded(outline.glyph_id));
         }
         match glyph {
@@ -205,7 +212,7 @@ impl Outlines<'_> {
                 let num_points_with_phantom = num_points + PHANTOM_POINT_COUNT;
                 outline.max_simple_points = outline.max_simple_points.max(num_points_with_phantom);
                 outline.points += num_points;
-                if outline.points > MAX_GLYF_POINTS {
+                if outline.points > MAX_OUTLINE_POINTS {
                     return Err(DrawError::TooManyPoints(outline.glyph_id));
                 }
                 outline.contours += simple.end_pts_of_contours().len();
@@ -227,7 +234,7 @@ impl Outlines<'_> {
                         continue;
                     };
                     *total_components += 1;
-                    if *total_components > MAX_GRAPH_EDGES {
+                    if *total_components > MAX_COMPOSITE_EDGES {
                         return Err(DrawError::RecursionLimitExceeded(outline.glyph_id));
                     }
                     self.outline_rec(
@@ -296,7 +303,7 @@ trait Scaler {
         glyph_id: GlyphId,
         recurse_depth: usize,
     ) -> Result<(), DrawError> {
-        if recurse_depth > GLYF_COMPOSITE_RECURSION_LIMIT {
+        if recurse_depth > MAX_RECURSION_DEPTH {
             return Err(DrawError::RecursionLimitExceeded(glyph_id));
         }
         let bounds = match &glyph {
@@ -572,7 +579,7 @@ impl Scaler for FreeTypeScaler<'_> {
         let scale = self.scale;
         let mut unscaled = self.phantom.map(|point| point.map(|x| x.to_bits()));
         if self.outlines.gvar.is_some() && !self.coords.is_empty() {
-            if let Ok(Some(deltas)) = self.outlines.gvar.as_ref().unwrap().phantom_point_deltas(
+            if let Some(deltas) = self.outlines.gvar.as_ref().unwrap().phantom_point_deltas(
                 &self.outlines.glyf,
                 &self.outlines.loca,
                 self.coords,
@@ -687,7 +694,7 @@ impl Scaler for FreeTypeScaler<'_> {
                     contours,
                     &mut buffers,
                 )
-                .is_ok()
+                .is_some()
             {
                 have_deltas = true;
             }
@@ -831,7 +838,7 @@ impl Scaler for FreeTypeScaler<'_> {
                 .ok_or(InsufficientMemory)?;
             if gvar
                 .composite_deltas(glyph_id, self.coords, &mut deltas[..])
-                .is_ok()
+                .is_some()
             {
                 // Apply deltas to phantom points.
                 for (phantom, delta) in self
@@ -1115,7 +1122,7 @@ impl Scaler for HarfBuzzScaler<'_> {
             && self.outlines.gvar.is_some()
             && !self.coords.is_empty()
         {
-            if let Ok(Some(deltas)) = self.outlines.gvar.as_ref().unwrap().phantom_point_deltas(
+            if let Some(deltas) = self.outlines.gvar.as_ref().unwrap().phantom_point_deltas(
                 &self.outlines.glyf,
                 &self.outlines.loca,
                 self.coords,
@@ -1199,7 +1206,7 @@ impl Scaler for HarfBuzzScaler<'_> {
                     contours,
                     &mut buffers,
                 )
-                .is_ok()
+                .is_some()
             {
                 for (point, delta) in points.iter_mut().zip(buffers.deltas.iter()) {
                     *point += *delta;
@@ -1212,6 +1219,10 @@ impl Scaler for HarfBuzzScaler<'_> {
                 *point *= self.scale;
             }
         }
+        // Commit the scaled phantom points. Without this the left side bearing
+        // adjustment subtracts font units from scaled coordinates.
+        self.phantom
+            .copy_from_slice(&points[phantom_start..phantom_start + PHANTOM_POINT_COUNT]);
 
         if points_start != 0 {
             // If we're not the first component, shift our contour end points.
@@ -1246,7 +1257,7 @@ impl Scaler for HarfBuzzScaler<'_> {
                 .ok_or(InsufficientMemory)?;
             if gvar
                 .composite_deltas(glyph_id, self.coords, &mut deltas[..])
-                .is_ok()
+                .is_some()
             {
                 // Apply deltas to phantom points.
                 for (phantom, delta) in self
@@ -1321,13 +1332,16 @@ impl Scaler for HarfBuzzScaler<'_> {
                         x *= hypot(transform[0], transform[2]);
                         y *= hypot(transform[1], transform[3]);
                     }
-                    Point::new(x, y)
+                    // The component's points are already scaled, so the
+                    // offset has to be as well.
+                    (Point::new(x, y)
                         + self
                             .memory
                             .composite_deltas
                             .get(delta_base + i)
                             .copied()
-                            .unwrap_or_default()
+                            .unwrap_or_default())
+                        * scale
                 }
                 Anchor::Point { base, component } => {
                     let (base_offset, component_offset) = (base as usize, component as usize);
@@ -1474,7 +1488,7 @@ mod tests {
         let gid = GlyphId::new(1);
         // Build a glyph made of more than the allowed number of components,
         // each of which is a valid empty simple glyph.
-        let [glyf_buf, loca_buf] = build_with_n_comps(MAX_GRAPH_EDGES + 1);
+        let [glyf_buf, loca_buf] = build_with_n_comps(MAX_COMPOSITE_EDGES + 1);
         let mut outlines = Outlines::new(&font).unwrap();
         outlines.glyf = Glyf::read(glyf_buf.data().into()).unwrap();
         outlines.loca = Loca::read(loca_buf.data().into(), true).unwrap();
@@ -1482,7 +1496,7 @@ mod tests {
         assert!(matches!(result, Err(DrawError::RecursionLimitExceeded(_))));
         // Check the edge condition; make sure we can load a composite with exactly the
         // limit number of components.
-        let [glyf_buf, loca_buf] = build_with_n_comps(MAX_GRAPH_EDGES);
+        let [glyf_buf, loca_buf] = build_with_n_comps(MAX_COMPOSITE_EDGES);
         let mut outlines = Outlines::new(&font).unwrap();
         outlines.glyf = Glyf::read(glyf_buf.data().into()).unwrap();
         outlines.loca = Loca::read(loca_buf.data().into(), true).unwrap();

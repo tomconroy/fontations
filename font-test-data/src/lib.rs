@@ -21,6 +21,8 @@ pub static CMAP10: &[u8] = include_bytes!("../test_data/ttf/cmap10.ttf");
 
 pub static TOFU: &[u8] = include_bytes!("../test_data/ttf/tofu.ttf");
 
+pub static LAST_RESORT_HE: &[u8] = include_bytes!("../test_data/ttf/LastResortHE-Regular.ttf");
+
 pub static COLR_GRADIENT_RECT: &[u8] =
     include_bytes!("../test_data/ttf/linear_gradient_rect_colr_1.ttf");
 
@@ -43,6 +45,9 @@ pub static NOTO_SERIF_DISPLAY_TRIMMED_GLYPHS: &str =
 
 pub static NOTO_SANS_JP_CFF: &[u8] =
     include_bytes!("../test_data/ttf/NotoSansJP-Regular.subset.otf");
+
+pub static MPLUS1CODE_VERTICAL_SUBSET: &[u8] =
+    include_bytes!("../test_data/ttf/mplus1code_vertical_subset.ttf");
 
 pub static CANTARELL_VF_TRIMMED: &[u8] =
     include_bytes!("../test_data/ttf/cantarell_vf_trimmed.ttf");
@@ -130,6 +135,8 @@ pub mod morx {
 pub mod varc {
     pub static CJK_6868: &[u8] = include_bytes!("../test_data/ttf/varc-6868.ttf");
     pub static CONDITIONALS: &[u8] = include_bytes!("../test_data/ttf/varc-ac01-conditional.ttf");
+    pub static STATIC_GVAR: &[u8] = include_bytes!("../test_data/ttf/varc-static-gvar.ttf");
+    pub static DELTA_PRECISION: &[u8] = include_bytes!("../test_data/ttf/varc-delta-precision.ttf");
 }
 
 pub mod closure {

@@ -6,7 +6,6 @@ use read_fonts::types::GlyphId;
 pub use read_fonts::ps::error::Error as CffError;
 
 pub use super::glyf::HintError;
-pub use super::path::ToPathError;
 
 /// Errors that may occur when drawing glyphs.
 #[derive(Clone, Debug)]
@@ -27,8 +26,6 @@ pub enum DrawError {
     InvalidAnchorPoint(GlyphId, u16),
     /// Error occurred while loading a PostScript (CFF/CFF2) glyph.
     PostScript(CffError),
-    /// Conversion from outline to path failed.
-    ToPath(ToPathError),
     /// The font data does not make sense: absent where it was required, too
     /// short, or self-inconsistent.
     ///
@@ -47,12 +44,6 @@ impl From<HintError> for DrawError {
     }
 }
 
-impl From<ToPathError> for DrawError {
-    fn from(e: ToPathError) -> Self {
-        Self::ToPath(e)
-    }
-}
-
 impl From<CffError> for DrawError {
     fn from(value: CffError) -> Self {
         Self::PostScript(value)
@@ -68,7 +59,7 @@ impl fmt::Display for DrawError {
             Self::RecursionLimitExceeded(gid) => write!(
                 f,
                 "Recursion limit ({}) exceeded when loading composite component {gid}",
-                super::GLYF_COMPOSITE_RECURSION_LIMIT,
+                read_fonts::limits::MAX_RECURSION_DEPTH,
             ),
             Self::TooManyPoints(gid) => write!(f, "Glyph {gid} contains more than 64k points"),
             Self::HintingFailed(e) => write!(f, "{e}"),
@@ -77,7 +68,6 @@ impl fmt::Display for DrawError {
                 "Invalid anchor point index ({index}) for composite glyph {gid}",
             ),
             Self::PostScript(e) => write!(f, "{e}"),
-            Self::ToPath(e) => write!(f, "{e}"),
             Self::Malformed => write!(f, "font data was absent or malformed"),
             Self::HarfBuzzHintingUnsupported => write!(
                 f,
