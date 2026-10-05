@@ -329,6 +329,7 @@ mod tests {
                     assert_eq!(op, ReadOperator::Blend);
                     groups.push(std::mem::take(&mut operands));
                 }
+                other => panic!("unexpected token {other:?}"),
             }
         }
         assert!(operands.is_empty());
