@@ -355,7 +355,7 @@ fn compile_private_dict(values: &Cff2PrivateDictValues) -> Vec<u8> {
 mod tests {
     use font_types::{F2Dot14, GlyphId};
     use kurbo::Point;
-    use read_fonts::{model::pen::OutlinePen, ps::cff::CffFontRef};
+    use read_fonts::{model::glyph::outline::OutlinePen, ps::cff::CffFontRef};
 
     use super::*;
     use crate::{
