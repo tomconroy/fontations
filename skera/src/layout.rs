@@ -6,8 +6,8 @@ use crate::fnv::FnvHashMap;
 use crate::{
     offset::SerializeSubset,
     offset_array::SubsetOffsetArray,
-    serialize::{OffsetWhence, SerializeErrorFlags, Serializer},
-    CollectVariationIndices, NameIdClosure, Plan, Serialize, SubsetState, SubsetTable,
+    serialize::{OffsetWhence, SerializeErrorFlags, SerializeResultEmpty, Serializer},
+    CollectVariationIndices, NameIdClosure, Plan, Serialize, SubsetState, SubsetTable, INVALID_GID,
 };
 use write_fonts::{
     read::{
@@ -23,6 +23,7 @@ use write_fonts::{
                 Intersect, LangSys, LangSysRecord, LookupList, RangeRecord, Script, ScriptList,
                 ScriptRecord, SizeParams, StylisticSetParams, VariationIndex,
             },
+            variations::NO_VARIATION_INDEX,
         },
         types::{GlyphId, GlyphId16, NameId},
         ArrayOfOffsets, FontData, FontRead, FontRef, MinByteRange, ReadError, TopLevelTable,
@@ -124,6 +125,9 @@ impl<'a> SubsetTable<'a> for VariationIndex<'a> {
     ) -> Result<(), SerializeErrorFlags> {
         let var_idx =
             ((self.delta_set_outer_index() as u32) << 16) + self.delta_set_inner_index() as u32;
+        if var_idx == NO_VARIATION_INDEX {
+            return Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY);
+        }
         let Some((new_idx, _)) = args.get(&var_idx) else {
             return Err(SerializeErrorFlags::SERIALIZE_ERROR_OTHER);
         };
@@ -187,20 +191,21 @@ impl<'a> SubsetTable<'a> for ClassDefFormat1<'a> {
         args: Self::ArgsForSubset,
     ) -> Result<Self::Output, SerializeErrorFlags> {
         let glyph_map = &plan.glyph_map_gsub;
+        let glyph_set = &plan.glyphset_gsub;
 
         let start = self.start_glyph_id().to_u32();
         let end = start + self.glyph_count() as u32 - 1;
-        let end = plan.glyphset_gsub.last().unwrap().to_u32().min(end);
+        let end = glyph_set.last().unwrap().to_u32().min(end);
 
         let class_values = self.class_value_array();
         let mut retained_classes = IntSet::empty();
 
-        let cap = glyph_map.len().min(self.glyph_count() as usize);
+        let cap = (glyph_set.len() as usize).min(self.glyph_count() as usize);
         let mut new_gid_classes = Vec::with_capacity(cap);
 
         for g in start..=end {
             let gid = GlyphId::from(g);
-            let Some(new_gid) = glyph_map.get(&gid) else {
+            let Some(new_gid) = map_gsub_glyph(glyph_map, gid) else {
                 continue;
             };
 
@@ -225,12 +230,12 @@ impl<'a> SubsetTable<'a> for ClassDefFormat1<'a> {
 
         let use_class_zero = if args.use_class_zero {
             let glyph_count = if let Some(glyph_filter) = args.glyph_filter {
-                glyph_map
-                    .keys()
-                    .filter(|&g| glyph_filter.get(*g).is_some())
+                glyph_set
+                    .iter()
+                    .filter(|&g| glyph_filter.get(g).is_some())
                     .count()
             } else {
-                glyph_map.len()
+                glyph_set.len() as usize
             };
             glyph_count <= new_gid_classes.len()
         } else {
@@ -267,16 +272,13 @@ impl<'a> SubsetTable<'a> for ClassDefFormat2<'a> {
         let mut retained_classes = IntSet::empty();
 
         let population = self.population();
-        let cap = glyph_map.len().min(population);
+        let cap = (glyph_set.len() as usize).min(population);
         let mut new_gid_classes = Vec::with_capacity(cap);
 
         let num_bits = 16 - self.class_range_count().leading_zeros() as u64;
         if population as u64 > glyph_set.len() * num_bits {
             for g in glyph_set.iter() {
-                if g.to_u32() > 0xFFFF_u32 {
-                    break;
-                }
-                let Some(new_gid) = glyph_map.get(&g) else {
+                let Some(new_gid) = map_gsub_glyph(glyph_map, g) else {
                     continue;
                 };
                 if let Some(glyph_filter) = args.glyph_filter {
@@ -307,7 +309,7 @@ impl<'a> SubsetTable<'a> for ClassDefFormat2<'a> {
                     .min(glyph_set.last().unwrap().to_u32());
                 for g in start..=end {
                     let gid = GlyphId::from(g);
-                    let Some(new_gid) = glyph_map.get(&gid) else {
+                    let Some(new_gid) = map_gsub_glyph(glyph_map, gid) else {
                         continue;
                     };
                     if let Some(glyph_filter) = args.glyph_filter {
@@ -325,12 +327,12 @@ impl<'a> SubsetTable<'a> for ClassDefFormat2<'a> {
         new_gid_classes.sort_by(|a, b| a.0.cmp(&b.0));
         let use_class_zero = if args.use_class_zero {
             let glyph_count = if let Some(glyph_filter) = args.glyph_filter {
-                glyph_map
-                    .keys()
-                    .filter(|&g| glyph_filter.get(*g).is_some())
+                glyph_set
+                    .iter()
+                    .filter(|&g| glyph_filter.get(g).is_some())
                     .count()
             } else {
-                glyph_map.len()
+                glyph_set.len() as usize
             };
             glyph_count <= new_gid_classes.len()
         } else {
@@ -566,15 +568,13 @@ impl<'a> SubsetTable<'a> for CoverageFormat1<'a> {
                         glyph_array
                             .binary_search_by(|g| g.get().to_u32().cmp(&old_gid.to_u32()))
                             .ok()
-                            .and_then(|_| plan.glyph_map_gsub.get(&old_gid))
-                            .copied()
+                            .and_then(|_| map_gsub_glyph(&plan.glyph_map_gsub, old_gid))
                     })
                     .collect()
             } else {
                 glyph_array
                     .iter()
-                    .filter_map(|g| plan.glyph_map_gsub.get(&GlyphId::from(g.get())))
-                    .copied()
+                    .filter_map(|g| map_gsub_glyph(&plan.glyph_map_gsub, GlyphId::from(g.get())))
                     .collect()
             };
 
@@ -602,7 +602,7 @@ impl<'a> SubsetTable<'a> for CoverageFormat2<'a> {
         // if/else branches return the same result, it's just an optimization that
         // we pick the faster approach depending on the number of glyphs
         let retained_glyphs: Vec<GlyphId> =
-            if self.population() > plan.glyph_map_gsub.len() * num_bits {
+            if self.population() > (plan.glyphset_gsub.len() as usize) * num_bits {
                 let range_records = self.range_records();
                 plan.glyphset_gsub
                     .iter()
@@ -618,18 +618,16 @@ impl<'a> SubsetTable<'a> for CoverageFormat2<'a> {
                                 }
                             })
                             .ok()
-                            .and_then(|_| plan.glyph_map_gsub.get(&g))
+                            .and_then(|_| map_gsub_glyph(&plan.glyph_map_gsub, g))
                     })
-                    .copied()
                     .collect()
             } else {
                 self.range_records()
                     .iter()
                     .flat_map(|r| {
                         r.iter()
-                            .filter_map(|g| plan.glyph_map_gsub.get(&GlyphId::from(g)))
+                            .filter_map(|g| map_gsub_glyph(&plan.glyph_map_gsub, GlyphId::from(g)))
                     })
-                    .copied()
                     .collect()
             };
 
@@ -732,12 +730,20 @@ impl<'a> Serialize<'a> for CoverageFormat2<'a> {
     }
 }
 
+#[inline]
+pub(crate) fn map_gsub_glyph(glyph_map: &[GlyphId], gid: GlyphId) -> Option<GlyphId> {
+    glyph_map
+        .get(gid.to_u32() as usize)
+        .copied()
+        .filter(|&g| g != INVALID_GID)
+}
+
 /// Return glyphs and their indices in the input Coverage table that intersect with the input glyph set
 /// returned glyphs are mapped into new glyph ids
 pub(crate) fn intersected_glyphs_and_indices(
     coverage: &CoverageTable,
     glyph_set: &IntSet<GlyphId>,
-    glyph_map: &FnvHashMap<GlyphId, GlyphId>,
+    glyph_map: &[GlyphId],
 ) -> (Vec<GlyphId>, IntSet<u16>) {
     let count = match coverage {
         CoverageTable::Format1(t) => t.glyph_count(),
@@ -755,17 +761,15 @@ pub(crate) fn intersected_glyphs_and_indices(
         for (idx, g) in glyph_set
             .iter()
             .filter_map(|g| coverage.get(g).map(|idx| (idx, g)))
-            .filter_map(|(idx, g)| glyph_map.get(&g).map(|new_g| (idx, *new_g)))
+            .filter_map(|(idx, g)| map_gsub_glyph(glyph_map, g).map(|new_g| (idx, new_g)))
         {
             glyphs.push(g);
             indices.insert(idx);
         }
     } else {
-        for (i, g) in coverage
-            .iter()
-            .enumerate()
-            .filter_map(|(i, g)| glyph_map.get(&GlyphId::from(g)).map(|&new_g| (i, new_g)))
-        {
+        for (i, g) in coverage.iter().enumerate().filter_map(|(i, g)| {
+            map_gsub_glyph(glyph_map, GlyphId::from(g)).map(|new_g| (i, new_g))
+        }) {
             glyphs.push(g);
             indices.insert(i as u16);
         }
@@ -1202,10 +1206,13 @@ impl<'a> SubsetTable<'a> for ScriptList<'_> {
             }
 
             let snap = s.snapshot();
-            match script_record.subset(plan, s, (c, font_data, i)) {
-                Ok(()) => num_records += 1,
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => s.revert_snapshot(snap),
-                Err(e) => return Err(e),
+            if !script_record
+                .subset(plan, s, (c, font_data, i))
+                .is_empty()?
+            {
+                num_records += 1;
+            } else {
+                s.revert_snapshot(snap);
             }
         }
         if num_records != 0 {
@@ -1661,10 +1668,8 @@ impl SubsetTable<'_> for ConditionSet<'_> {
         let conditions = self.conditions();
         let condition_count = self.condition_count() as usize;
         for i in 0..condition_count {
-            match conditions.subset_offset(i, s, plan, ()) {
-                Ok(()) => count += 1,
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => continue,
-                Err(e) => return Err(e),
+            if !conditions.subset_offset(i, s, plan, ()).is_empty()? {
+                count += 1;
             }
         }
 
@@ -1723,10 +1728,11 @@ impl<'a> SubsetTable<'a> for FeatureTableSubstitution<'_> {
         let (feature_index_map, c) = args;
         let font_data = self.offset_data();
         for sub in self.substitutions() {
-            match sub.subset(plan, s, (feature_index_map, c, font_data)) {
-                Ok(()) => subs_count += 1,
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => continue,
-                Err(e) => return Err(e),
+            if !sub
+                .subset(plan, s, (feature_index_map, c, font_data))
+                .is_empty()?
+            {
+                subs_count += 1;
             }
         }
 
@@ -1754,14 +1760,14 @@ impl<'a> SubsetTable<'a> for FeatureTableSubstitutionRecord {
             return Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY);
         }
         let (feature_index_map, c, font_data) = args;
-        let Some(new_feature_indx) = feature_index_map.get(&self.feature_index()) else {
+        let Some(new_feature_index) = feature_index_map.get(&self.feature_index()) else {
             return Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY);
         };
 
         let alternate_feature = self
             .alternate_feature(font_data)
             .map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))?;
-        s.embed(*new_feature_indx)?;
+        s.embed(*new_feature_index)?;
 
         let feature_offset_pos = s.embed(0_u32)?;
         Offset32::serialize_subset(&alternate_feature, s, plan, c, feature_offset_pos)
@@ -1846,11 +1852,10 @@ mod test {
         plan.glyphset_gsub.insert(GlyphId::from(34_u32));
         plan.glyphset_gsub.insert(GlyphId::from(35_u32));
 
-        plan.glyph_map_gsub.insert(GlyphId::NOTDEF, GlyphId::NOTDEF);
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(34_u32), GlyphId::from(1_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(35_u32), GlyphId::from(2_u32));
+        plan.glyph_map_gsub = vec![INVALID_GID; 36];
+        plan.glyph_map_gsub[0] = GlyphId::NOTDEF;
+        plan.glyph_map_gsub[34] = GlyphId::from(1_u32);
+        plan.glyph_map_gsub[35] = GlyphId::from(2_u32);
 
         let mut s = Serializer::new(1024);
         assert_eq!(s.start_serialize(), Ok(()));
@@ -1920,9 +1925,9 @@ mod test {
         plan.glyphset_gsub.insert(GlyphId::NOTDEF);
         plan.glyphset_gsub.insert(GlyphId::from(68_u32));
 
-        plan.glyph_map_gsub.insert(GlyphId::NOTDEF, GlyphId::NOTDEF);
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(68_u32), GlyphId::from(1_u32));
+        plan.glyph_map_gsub = vec![INVALID_GID; 69];
+        plan.glyph_map_gsub[0] = GlyphId::NOTDEF;
+        plan.glyph_map_gsub[68] = GlyphId::from(1_u32);
 
         let mut s = Serializer::new(1024);
         assert_eq!(s.start_serialize(), Ok(()));
@@ -1965,9 +1970,9 @@ mod test {
         plan.glyphset_gsub.insert(GlyphId::NOTDEF);
         plan.glyphset_gsub.insert(GlyphId::from(68_u32));
 
-        plan.glyph_map_gsub.insert(GlyphId::NOTDEF, GlyphId::NOTDEF);
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(68_u32), GlyphId::from(3_u32));
+        plan.glyph_map_gsub = vec![INVALID_GID; 69];
+        plan.glyph_map_gsub[0] = GlyphId::NOTDEF;
+        plan.glyph_map_gsub[68] = GlyphId::from(3_u32);
 
         let mut s = Serializer::new(1024);
         assert_eq!(s.start_serialize(), Ok(()));
@@ -2007,15 +2012,12 @@ mod test {
         plan.glyphset_gsub.insert(GlyphId::from(36_u32));
         plan.glyphset_gsub.insert(GlyphId::from(56_u32));
 
-        plan.glyph_map_gsub.insert(GlyphId::NOTDEF, GlyphId::NOTDEF);
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(34_u32), GlyphId::from(1_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(35_u32), GlyphId::from(2_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(36_u32), GlyphId::from(3_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(56_u32), GlyphId::from(4_u32));
+        plan.glyph_map_gsub = vec![INVALID_GID; 57];
+        plan.glyph_map_gsub[0] = GlyphId::NOTDEF;
+        plan.glyph_map_gsub[34] = GlyphId::from(1_u32);
+        plan.glyph_map_gsub[35] = GlyphId::from(2_u32);
+        plan.glyph_map_gsub[36] = GlyphId::from(3_u32);
+        plan.glyph_map_gsub[56] = GlyphId::from(4_u32);
 
         let mut s = Serializer::new(1024);
         assert_eq!(s.start_serialize(), Ok(()));

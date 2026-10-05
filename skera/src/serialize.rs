@@ -8,7 +8,6 @@ use std::{
 
 use crate::fnv::FnvHasher;
 use hashbrown::HashTable;
-use std::collections::BTreeMap;
 use write_fonts::types::{FixedSize, Scalar, Uint24};
 
 /// An error which occurred during the serialization of a table using Serializer.
@@ -59,6 +58,21 @@ impl std::ops::Not for SerializeErrorFlags {
     #[inline]
     fn not(self) -> bool {
         self == SerializeErrorFlags::SERIALIZE_ERROR_NONE
+    }
+}
+
+pub(crate) trait SerializeResultEmpty {
+    #[allow(clippy::wrong_self_convention)]
+    fn is_empty(self) -> Result<bool, SerializeErrorFlags>;
+}
+
+impl SerializeResultEmpty for Result<(), SerializeErrorFlags> {
+    fn is_empty(self) -> Result<bool, SerializeErrorFlags> {
+        match self {
+            Ok(()) => Ok(false),
+            Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -120,9 +134,9 @@ impl Object {
         self.tail
     }
 
-    // used by repacker only, real_links vector is converted to BTreeMap
-    pub(crate) fn real_links(&self) -> BTreeMap<u32, Link> {
-        self.real_links.iter().map(|l| (l.position, *l)).collect()
+    // used by repacker only
+    pub(crate) fn real_links(&self) -> Vec<Link> {
+        self.real_links.clone()
     }
 
     pub(crate) fn virtual_links(&self) -> Vec<Link> {
@@ -180,6 +194,10 @@ impl Link {
 
     pub(crate) fn bias(&self) -> u32 {
         self.bias
+    }
+
+    pub(crate) fn position(&self) -> u32 {
+        self.position
     }
 
     pub(crate) fn is_signed(&self) -> bool {
@@ -1352,7 +1370,7 @@ mod test {
             assert_eq!(s.packed_map.hash_table.len(), 1);
             // share=true, duplicate object won't be added into packed vector
             assert_eq!(s.packed.len(), 1);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             assert_eq!(s.tail, 97);
 
@@ -1365,7 +1383,7 @@ mod test {
             assert_eq!(s.pop_pack(true), Some(1));
             assert_eq!(s.packed_map.hash_table.len(), 2);
             assert_eq!(s.packed.len(), 2);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             //check that tail is updated
             assert_eq!(s.tail, 95);
@@ -1383,7 +1401,7 @@ mod test {
             assert_eq!(s.packed_map.hash_table.len(), 2);
             // share=true, duplicate object will be added into the packed vector
             assert_eq!(s.packed.len(), 3);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             assert_eq!(s.tail, 92);
         }
@@ -1411,7 +1429,7 @@ mod test {
             assert_eq!(s.pop_pack(true), Some(3));
             assert_eq!(s.packed_map.hash_table.len(), 3);
             assert_eq!(s.packed.len(), 4);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             assert_eq!(s.tail, 89);
 
@@ -1433,7 +1451,7 @@ mod test {
                 objidx: 1,
             };
             obj.virtual_links.push(link);
-            // check that virtual links doesn't affect euqality
+            // check that virtual links doesn't affect equality
             assert_eq!(s.pop_pack(true), Some(3));
             assert_eq!(s.packed_map.hash_table.len(), 3);
             assert_eq!(s.packed.len(), 4);
@@ -1471,7 +1489,7 @@ mod test {
             assert_eq!(s.pop_pack(true), Some(4));
             assert_eq!(s.packed_map.hash_table.len(), 4);
             assert_eq!(s.packed.len(), 5);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             assert_eq!(s.tail, 86);
 
@@ -1498,7 +1516,7 @@ mod test {
             // obj is added into both hash_table and packed vector
             assert_eq!(s.packed_map.hash_table.len(), 5);
             assert_eq!(s.packed.len(), 6);
-            //check to make sure head is rewinded
+            //check to make sure head is rewound
             assert_eq!(s.head, 3);
             assert_eq!(s.tail, 83);
         }
@@ -1531,7 +1549,7 @@ mod test {
         assert_eq!(s.head, 6);
         assert_eq!(s.tail, 97);
         s.pop_discard();
-        //check that head is rewinded
+        //check that head is rewound
         assert_eq!(s.head, 3);
         assert_eq!(s.tail, 97);
         //discarded obj is not added into packed vector

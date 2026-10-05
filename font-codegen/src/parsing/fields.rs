@@ -35,6 +35,20 @@ pub(crate) struct Field {
     /// These fields must be present, which means reads can unwrap (and could even
     /// be unsafe.)
     pub(crate) validated_at_parse: bool,
+    /// `true` if this field is read at an offset within the enclosing table's
+    /// data, rather than from data sliced to the field.
+    ///
+    /// This is required by fields whose type holds offsets that resolve against
+    /// the enclosing table; see the `FontReadAt` trait in read-fonts. It is
+    /// computed during resolution: seeded from the extern records declared with
+    /// a lifetime, then closed over containment. See `build_positioned_set`.
+    pub(crate) positioned: bool,
+    /// `true` if this field is a record of known, fixed size embedded directly
+    /// in its parent, rather than reached through an array or an offset.
+    ///
+    /// Such a field is read by borrowing it out of the parent's data. Computed
+    /// during resolution, from the records that are zerocopy.
+    pub(crate) fixed_size_record: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -166,8 +180,10 @@ impl Parse for Field {
             attrs,
             name,
             typ,
-            // computed later
+            // all computed later
             validated_at_parse: false,
+            positioned: false,
+            fixed_size_record: false,
         })
     }
 }

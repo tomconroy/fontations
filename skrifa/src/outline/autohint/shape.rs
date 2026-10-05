@@ -13,7 +13,7 @@ use raw::{
         varc::CoverageTable,
     },
     types::Tag,
-    ReadError, TableProvider,
+    TableProvider,
 };
 
 // To prevent infinite recursion in contextual lookups. Matches HB
@@ -479,7 +479,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                             // required and if we're not under a contextual
                             // lookup
                             if self.need_blue_substs && self.lookup_depth == 1 {
-                                self.check_blue_coverage(Ok(coverage));
+                                self.check_blue_coverage(Some(coverage));
                             }
                         }
                         SingleSubst::Format2(table) => {
@@ -488,7 +488,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                             }
                             // See above
                             if self.need_blue_substs && self.lookup_depth == 1 {
-                                self.check_blue_coverage(table.coverage());
+                                self.check_blue_coverage(table.coverage().ok());
                             }
                         }
                     }
@@ -503,7 +503,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
                     }
                     // See above
                     if self.need_blue_substs && self.lookup_depth == 1 {
-                        self.check_blue_coverage(table.coverage());
+                        self.check_blue_coverage(table.coverage().ok());
                     }
                 }
             }
@@ -623,7 +623,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
     /// returns the range of touched glyphs.
     fn finish(self) -> Option<Range<usize>> {
         self.visited_set.clear();
-        if self.min_gid > self.max_gid {
+        if self.min_gid > self.max_gid || self.glyph_styles.is_empty() {
             // We didn't touch any glyphs
             return None;
         }
@@ -632,7 +632,7 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
             // We didn't find any substitutions for our blue strings so
             // we ignore the style. Clear the GSUB marker for any touched
             // glyphs
-            for glyph in &mut self.glyph_styles[range] {
+            for glyph in self.glyph_styles.get_mut(range)? {
                 glyph.clear_from_gsub();
             }
             None
@@ -643,8 +643,8 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
 
     /// Checks the given coverage table for any characters in the blue
     /// strings associated with our current style.
-    fn check_blue_coverage(&mut self, coverage: Result<CoverageTable<'a>, ReadError>) {
-        let Ok(coverage) = coverage else {
+    fn check_blue_coverage(&mut self, coverage: Option<CoverageTable<'a>>) {
+        let Some(coverage) = coverage else {
             return;
         };
         for (blue_str, _) in self.style.script.blues {
@@ -789,6 +789,25 @@ mod tests {
             &mut visited_set,
         );
         gsub_handler.process_lookup(0).unwrap();
+    }
+
+    #[test]
+    fn finish_with_empty_glyph_styles() {
+        let font = FontRef::new(font_test_data::NOTOSERIF_AUTOHINT_SHAPING).unwrap();
+        let shaper = Shaper::new(&font, ShaperMode::BestEffort);
+        let style = &style::STYLE_CLASSES[style::StyleClass::LATN];
+        let lookup_list_buf = BadLookupBuilder::default().build();
+        let lookup_list = SubstitutionLookupList::read(FontData::new(&lookup_list_buf)).unwrap();
+        let mut set_buf = [0u8; 8192];
+        let mut visited_set = VisitedLookupSet(&mut set_buf);
+        let gsub_handler = GsubHandler::new(
+            &shaper.charmap,
+            &lookup_list,
+            style,
+            &mut [],
+            &mut visited_set,
+        );
+        assert_eq!(gsub_handler.finish(), None);
     }
 
     #[test]

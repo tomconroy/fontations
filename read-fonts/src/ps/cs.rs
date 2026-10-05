@@ -20,6 +20,17 @@ use crate::{
 /// <https://adobe-type-tools.github.io/font-tech-notes/pdfs/5177.Type2.pdf#page=33>
 pub const NESTING_DEPTH_LIMIT: u32 = 10;
 
+/// Maximum number of operations that can be processed during charstring
+/// evaluation.
+///
+/// HarfBuzz limits this to 200,000
+/// (<https://github.com/harfbuzz/harfbuzz/blob/a6357ca3f7e73165ba8b201b65f1130059e34255/src/hb-limits.hh#L108>)
+/// and threat analysis suggested 2,000,000 so a value of 1,000,000
+/// was chosen to match our instruction limit for the TrueType interpreter.
+///
+/// FreeType only limits depth, not number of operations.
+const MAX_OPERATIONS: u32 = 1_000_000;
+
 /// The type of a PostScript charstring.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CharstringKind {
@@ -68,27 +79,37 @@ impl<'a> CharstringContext for (&'a [u8], &'a Index<'a>, &'a Index<'a>, &'a Inde
     fn seac_components(&self, base_code: i32, accent_code: i32) -> Result<[&[u8]; 2], Error> {
         let cff = Cff::read(FontData::new(self.0))?;
         let charset = cff
-            .charset(0)?
-            .or_else(|| Charset::new(FontData::default(), 0, self.1.count()).ok())
+            .charset(0)
+            .or_else(|| Charset::new(FontData::default(), 0, self.1.count()))
             .ok_or(Error::MissingCharset)?;
         let seac_to_gid = |code: i32| {
             let code: u8 = code.try_into().ok()?;
             let sid = *super::encoding::STANDARD_ENCODING.get(code as usize)?;
-            charset.glyph_id(Sid::new(sid as u16)).ok()
+            charset.glyph_id(Sid::new(sid as u16))
         };
         let accent_gid = seac_to_gid(accent_code).ok_or(Error::InvalidSeacCode(accent_code))?;
         let base_gid = seac_to_gid(base_code).ok_or(Error::InvalidSeacCode(base_code))?;
-        let accent_charstring = self.1.get(accent_gid.to_u32() as usize)?;
-        let base_charstring = self.1.get(base_gid.to_u32() as usize)?;
+        let accent_charstring = self
+            .1
+            .get(accent_gid.to_u32() as usize)
+            .ok_or(Error::Malformed)?;
+        let base_charstring = self
+            .1
+            .get(base_gid.to_u32() as usize)
+            .ok_or(Error::Malformed)?;
         Ok([base_charstring, accent_charstring])
     }
 
     fn global_subr(&self, index: i32) -> Result<&[u8], Error> {
-        self.2.get((index + self.2.subr_bias()) as usize)
+        self.2
+            .get((index + self.2.subr_bias()) as usize)
+            .ok_or(Error::Malformed)
     }
 
     fn subr(&self, index: i32) -> Result<&[u8], Error> {
-        self.3.get((index + self.3.subr_bias()) as usize)
+        self.3
+            .get((index + self.3.subr_bias()) as usize)
+            .ok_or(Error::Malformed)
     }
 }
 
@@ -186,6 +207,8 @@ struct Evaluator<'a, S> {
     stack: Stack,
     stack_ix: usize,
     in_seac: bool,
+    /// Number of operators or numbers processed so far
+    ops_done: u32,
 }
 
 impl<'a, S> Evaluator<'a, S>
@@ -215,6 +238,7 @@ where
             wx: Fixed::ZERO,
             stack_ix: 0,
             in_seac: false,
+            ops_done: 0,
         }
     }
 
@@ -242,6 +266,10 @@ where
         let mut cursor = crate::FontData::new(charstring_data).cursor();
         let mut seen_endchar = false;
         while cursor.remaining_bytes() != 0 {
+            self.ops_done += 1;
+            if self.ops_done > MAX_OPERATIONS {
+                return Err(Error::CharstringNestingDepthLimitExceeded);
+            }
             let b0 = cursor.read::<u8>()?;
             match b0 {
                 // See "3.2 Charstring Number Encoding" <https://adobe-type-tools.github.io/font-tech-notes/pdfs/5177.Type2.pdf#page=12>
@@ -266,7 +294,7 @@ where
                     // FreeType ignores reserved (unknown) operators.
                     // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/80a507a6b8e3d2906ad2c8ba69329bd2fb2a85ef/src/psaux/psintrp.c#L703>
                     // and fontations issue <https://github.com/googlefonts/fontations/issues/1680>
-                    if let Ok(operator) = Operator::read(&mut cursor, b0) {
+                    if let Some(operator) = Operator::read(&mut cursor, b0) {
                         seen_endchar |= operator == Operator::EndChar;
                         if !self.evaluate_operator(operator, &mut cursor, nesting_depth)? {
                             break;
@@ -887,9 +915,7 @@ where
         let weight_vector = self.context.weight_vector();
         let num_points = (subr_idx - 13) as usize + (subr_idx == 18) as usize;
         if num_args != num_points * weight_vector.len() {
-            return Err(Error::Read(crate::ReadError::MalformedData(
-                "incorrect number of multiple masters arguments",
-            )));
+            return Err(Error::Malformed);
         }
         // The stack is setup to contain `num_points` values followed
         // by `num_points * (num_weights - 1)` deltas for each point.
@@ -1084,16 +1110,14 @@ enum Operator {
 }
 
 impl Operator {
-    fn read(cursor: &mut Cursor, b0: u8) -> Result<Self, Error> {
+    fn read(cursor: &mut Cursor, b0: u8) -> Option<Self> {
         // Escape opcode for accessing two byte operators
         const ESCAPE: u8 = 12;
-        let (opcode, operator) = if b0 == ESCAPE {
-            let b1 = cursor.read::<u8>()?;
-            (b1, Self::from_two_byte_opcode(b1))
+        if b0 == ESCAPE {
+            Self::from_two_byte_opcode(cursor.read::<u8>().ok()?)
         } else {
-            (b0, Self::from_opcode(b0))
-        };
-        operator.ok_or(Error::InvalidCharstringOperator(opcode))
+            Self::from_opcode(b0)
+        }
     }
 
     /// Creates an operator from the given opcode.
@@ -1893,6 +1917,31 @@ mod tests {
                 Command::LineTo(x, Fixed::ZERO)
             ]
         );
+    }
+
+    #[test]
+    fn operation_limit() {
+        // Reserved operators are ignored but still count toward total operations.
+        // This verifies the guard using a realistic charstring stream
+        let charstring = vec![0u8; MAX_OPERATIONS as usize + 1];
+        let mut commands = CaptureCommandSink::default();
+        // This one should succeed
+        evaluate(
+            &NullContext(CharstringKind::Type2),
+            None,
+            &charstring[..MAX_OPERATIONS as usize],
+            &mut commands,
+        )
+        .unwrap();
+        // And this one should fail
+        let err = evaluate(
+            &NullContext(CharstringKind::Type2),
+            None,
+            &charstring,
+            &mut commands,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::CharstringNestingDepthLimitExceeded));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::collections::IntSet;
 #[cfg(feature = "std")]
 pub(crate) use closure::{
     ContextFormat1, ContextFormat2, ContextFormat3, LayoutLookupList, LookupClosure,
-    LookupClosureCtx, MAX_LOOKUP_VISIT_COUNT, MAX_NESTING_LEVEL,
+    LookupClosureCtx, SeqCache, MAX_LOOKUP_VISIT_COUNT, MAX_NESTING_LEVEL,
 };
 
 #[cfg(feature = "std")]
@@ -34,11 +34,6 @@ include!("../../generated/generated_layout.rs");
 impl<'a, T: FontRead<'a, Args = ()>> Lookup<'a, T> {
     pub fn get_subtable(&self, offset: Offset16) -> Result<T, ReadError> {
         self.resolve_offset(offset)
-    }
-
-    #[cfg(feature = "experimental_traverse")]
-    fn traverse_lookup_flag(&self) -> traversal::FieldType<'a> {
-        self.lookup_flag().to_bits().into()
     }
 }
 
@@ -130,25 +125,6 @@ impl<'a> FontRead<'a> for FeatureParams<'a> {
             // NOTE: what even is our error condition here? an offset exists but
             // we don't know the tag?
             _ => Err(ReadError::InvalidFormat(0xdead)),
-        }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-impl<'a> SomeTable<'a> for FeatureParams<'a> {
-    fn type_name(&self) -> &str {
-        match self {
-            FeatureParams::StylisticSet(table) => table.type_name(),
-            FeatureParams::Size(table) => table.type_name(),
-            FeatureParams::CharacterVariant(table) => table.type_name(),
-        }
-    }
-
-    fn get_field(&self, idx: usize) -> Option<Field<'a>> {
-        match self {
-            FeatureParams::StylisticSet(table) => table.get_field(idx),
-            FeatureParams::Size(table) => table.get_field(idx),
-            FeatureParams::CharacterVariant(table) => table.get_field(idx),
         }
     }
 }
@@ -463,15 +439,18 @@ impl<'a> ClassDefFormat1<'a> {
         }
 
         let start_glyph = self.start_glyph_id().to_u32();
-        let glyph_count = self.glyph_count();
-        let end_glyph = start_glyph + glyph_count as u32 - 1;
+        let class_values = self.class_value_array();
+        if class_values.is_empty() {
+            out.insert(0);
+            return out;
+        }
+        let end_glyph = start_glyph + class_values.len() as u32 - 1;
         if glyphs.first().unwrap().to_u32() < start_glyph
             || glyphs.last().unwrap().to_u32() > end_glyph
         {
             out.insert(0);
         }
 
-        let class_values = self.class_value_array();
         if glyphs.contains(GlyphId::from(start_glyph)) {
             let Some(start_glyph_class) = class_values.first() else {
                 return out;
@@ -530,6 +509,40 @@ impl<'a> ClassDefFormat1<'a> {
         }
         out
     }
+
+    /// Checks whether any glyph in the given glyphs set intersects with this table and is assigned to the specified class value.
+    #[cfg(feature = "std")]
+    fn intersects_class_glyphs(&self, glyphs: &IntSet<GlyphId>, class: u16) -> bool {
+        if glyphs.is_empty() {
+            return false;
+        }
+
+        let start_glyph = self.start_glyph_id().to_u32();
+        let end_glyph = start_glyph + self.glyph_count() as u32 - 1;
+        if class == 0 {
+            let first = glyphs.first().unwrap();
+            if first.to_u32() < start_glyph {
+                return true;
+            }
+
+            let last = glyphs.last().unwrap();
+            if last.to_u32() > end_glyph {
+                return true;
+            }
+        }
+
+        let class_values = self.class_value_array();
+        for g in glyphs.range(GlyphId::from(start_glyph)..=GlyphId::from(end_glyph)) {
+            let idx = g.to_u32() - start_glyph;
+            let Some(c) = class_values.get(idx as usize) else {
+                return false;
+            };
+            if c.get() == class {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl<'a> ClassDefFormat2<'a> {
@@ -579,13 +592,11 @@ impl<'a> ClassDefFormat2<'a> {
             return out;
         }
 
-        if self.class_range_count() == 0 {
+        let range_records = self.class_range_records();
+        let Some(first_record) = range_records.first() else {
             out.insert(0);
             return out;
-        }
-
-        let range_records = self.class_range_records();
-        let first_record = range_records[0];
+        };
 
         if glyphs.first().unwrap() < first_record.start_glyph_id() {
             out.insert(0);
@@ -681,6 +692,78 @@ impl<'a> ClassDefFormat2<'a> {
         }
         out
     }
+
+    /// Checks whether any glyph in the given glyphs set intersects with this table and is assigned to the specified class value.
+    #[cfg(feature = "std")]
+    fn intersects_class_glyphs(&self, glyphs: &IntSet<GlyphId>, class: u16) -> bool {
+        if glyphs.is_empty() {
+            return false;
+        }
+
+        let first = glyphs.first().unwrap().to_u32();
+        if class == 0 {
+            let mut last_end = first;
+            for (i, range) in self.class_range_records().iter().enumerate() {
+                let range_start = range.start_glyph_id().to_u32();
+                let range_end = range.end_glyph_id().to_u32();
+                if i == 0 {
+                    if first < range_start {
+                        return true;
+                    }
+                    last_end = range_end;
+                    continue;
+                }
+
+                if range_start == last_end + 1 {
+                    last_end = range_end;
+                    continue;
+                }
+
+                if glyphs
+                    .intersects_range(GlyphId::from(last_end + 1)..=GlyphId::from(range_start - 1))
+                {
+                    return true;
+                };
+                last_end = range_end + 1;
+            }
+            if glyphs
+                .iter_after(GlyphId::from(last_end + 1))
+                .next()
+                .is_some()
+            {
+                return true;
+            }
+        }
+
+        let num_ranges = self.class_range_count();
+        if num_ranges as u64 > glyphs.len() * self.cost() as u64 {
+            for g in glyphs.iter() {
+                let c = self.get(g);
+                if c == class {
+                    return true;
+                }
+            }
+        } else {
+            let last = glyphs.last().unwrap().to_u32();
+            for range in self.class_range_records() {
+                let range_start = range.start_glyph_id().to_u32();
+                let range_end = range.end_glyph_id().to_u32();
+                if range_start > last {
+                    break;
+                }
+                if range_end < first {
+                    continue;
+                }
+                if range.class() == class
+                    && glyphs
+                        .intersects_range(GlyphId::from(range_start)..=GlyphId::from(range_end))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 impl ClassRangeRecord {
@@ -754,13 +837,26 @@ impl ClassDef<'_> {
             ClassDef::Format2(table) => table.intersected_class_glyphs(glyphs, class),
         }
     }
+
+    /// Checks whether any glyph in the given glyphs set intersects with this table and is assigned to the specified class value.
+    #[cfg(feature = "std")]
+    pub fn intersects_class_glyphs(&self, glyphs: &IntSet<GlyphId>, class: u16) -> bool {
+        match self {
+            ClassDef::Format1(table) => table.intersects_class_glyphs(glyphs, class),
+            ClassDef::Format2(table) => table.intersects_class_glyphs(glyphs, class),
+        }
+    }
 }
 
 impl<'a> Device<'a> {
     /// Iterate over the decoded values for this device
     pub fn iter(&self) -> impl Iterator<Item = i8> + 'a {
         let format = self.delta_format();
-        let mut n = (self.end_size() - self.start_size()) as usize + 1;
+        let mut n = self
+            .end_size()
+            .checked_sub(self.start_size())
+            .map(|x| x as usize + 1)
+            .unwrap_or(0);
         let deltas_per_word = match format {
             DeltaFormat::Local2BitDeltas => 8,
             DeltaFormat::Local4BitDeltas => 4,
@@ -788,13 +884,13 @@ fn iter_packed_values(raw: u16, format: DeltaFormat, n: usize) -> impl Iterator<
     let max_per_word = 16 / bits;
     #[allow(clippy::needless_range_loop)] // enumerate() feels weird here
     for i in 0..n.min(max_per_word) {
-        let mask = mask << ((16 - bits) - i * bits);
-        let val = (raw & mask) >> ((16 - bits) - i * bits);
-        let sign = val & sign_mask != 0;
-
-        let val = if sign {
-            // it is 2023 and I am googling to remember how twos compliment works
-            -((((!val) & mask) + 1) as i8)
+        let shift = (16 - bits) - i * bits;
+        // pull the n-bit field down to the low bits before decoding, so the
+        // sign handling below always works on a low-aligned value
+        let val = (raw >> shift) & mask;
+        let val = if val & sign_mask != 0 {
+            // sign extend the n-bit value to a full i8
+            (val | !mask) as i8
         } else {
             val as i8
         };
@@ -922,6 +1018,22 @@ mod tests {
     }
 
     #[test]
+    fn classdef_format1_short_read_no_panic() {
+        // glyph_count is 5, but only one class value is present.
+        let classdef = ClassDefFormat1::read(FontData::new(&[0, 1, 0, 10, 0, 5, 0, 1])).unwrap();
+        let glyphs: IntSet<GlyphId> = [GlyphId::new(10), GlyphId::new(11), GlyphId::new(14)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(classdef.get(GlyphId::new(10)), 0);
+        assert_eq!(classdef.get(GlyphId::new(11)), 0);
+        assert!(!classdef.intersects_class_glyphs(&glyphs, 2));
+
+        let class_ones = classdef.intersected_class_glyphs(&glyphs, 1);
+        assert!(class_ones.is_empty());
+    }
+
+    #[test]
     fn delta_decode() {
         // these examples come from the spec
         assert_eq!(
@@ -936,6 +1048,32 @@ mod tests {
     }
 
     #[test]
+    fn delta_decode_negative_not_in_last_slot() {
+        // A negative delta must decode correctly regardless of its position
+        // within the word, not only in the least significant slot.
+        // 8-bit: bytes 0xf4, 0x01 -> -12, 1
+        assert_eq!(
+            iter_packed_values(0xf401, DeltaFormat::Local8BitDeltas, 2).collect::<Vec<_>>(),
+            &[-12, 1]
+        );
+        // 4-bit: nibbles 0x8, 0x1, 0x2, 0x3 -> -8, 1, 2, 3
+        assert_eq!(
+            iter_packed_values(0x8123, DeltaFormat::Local4BitDeltas, 4).collect::<Vec<_>>(),
+            &[-8, 1, 2, 3]
+        );
+        // 2-bit: 10 01 01 01 -> -2, 1, 1, 1
+        assert_eq!(
+            iter_packed_values(0x9540, DeltaFormat::Local2BitDeltas, 4).collect::<Vec<_>>(),
+            &[-2, 1, 1, 1]
+        );
+        // the smallest 8-bit value in a leading slot must not overflow
+        assert_eq!(
+            iter_packed_values(0x8000, DeltaFormat::Local8BitDeltas, 2).collect::<Vec<_>>(),
+            &[-128, 0]
+        );
+    }
+
+    #[test]
     fn delta_decode_all() {
         // manually generated with write-fonts
         let bytes: &[u8] = &[0, 7, 0, 13, 0, 3, 1, 244, 30, 245, 101, 8, 42, 0];
@@ -944,6 +1082,14 @@ mod tests {
             device.iter().collect::<Vec<_>>(),
             &[1i8, -12, 30, -11, 101, 8, 42]
         );
+    }
+
+    #[test]
+    fn device_decode_does_not_overflow() {
+        // manually generated with write-fonts
+        let bytes: &[u8] = &[0, 0xA, 0, 1, 0, 1];
+        // Don't panic with overflow
+        Device::read(bytes.into()).unwrap().iter().count();
     }
 
     #[test]

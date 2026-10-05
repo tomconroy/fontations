@@ -1,6 +1,6 @@
 [package]
 name = "read-fonts"
-version = "0.42.1"
+version = "0.44.0"
 description = "Reading OpenType font files."
 readme = "README.md"
 categories = ["text-processing", "parsing", "graphics"]
@@ -12,8 +12,8 @@ repository.workspace = true
 
 [package.metadata.docs.rs]
 # To build locally:
-# RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --features libm,serde,std
-features = ["libm", "serde", "std"]
+# RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --features agl,libm,serde,std
+features = ["agl", "libm", "serde", "std"]
 
 [features]
 std = ["font-types/std"]
@@ -22,15 +22,17 @@ scaler_test = []
 # experimental support for incremental font transfer (https://www.w3.org/TR/IFT/)
 # code behind this feature does not honor semver and may break at any time.
 ift = []
-# this feature is not stable, but provides untyped traversal of font tables.
-# we do not consider this feature public API for the purposes of semver.
-experimental_traverse = ["std"]
 # Enables experimental implementations of proposed changes to the spec
 # as discussed at https://github.com/harfbuzz/boring-expansion-spec
 spec_next = []
 # Enables support for a new font API, as proposed at
 # https://github.com/googlefonts/oxidize/pull/77
-experimental_font_api = []
+experimental_font_api = ["dep:yoke"]
+# Does nothing. Traversal was removed in #2087, but consumers still ask for
+# this feature -- fontconfig's fc-fontations does, without using any of it --
+# and cargo fails to resolve a feature that does not exist. Keeping it empty
+# lets them upgrade before they edit their manifests.
+experimental_traverse = []
 default = ["std"]
 serde = ["dep:serde", "font-types/serde"]
 libm = ["dep:core_maths"]
@@ -39,6 +41,7 @@ agl = []
 
 [dependencies]
 font-types = { workspace = true, features = ["bytemuck"] }
+yoke = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 core_maths = { workspace = true, optional = true }
 bytemuck = { workspace = true }
@@ -68,4 +71,8 @@ harness = false
 
 [[bench]]
 name = "glyph_names"
+harness = false
+
+[[bench]]
+name = "type1"
 harness = false

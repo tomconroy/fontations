@@ -87,9 +87,6 @@ pub(crate) struct FieldAttrs {
     pub(crate) compile_type: Option<Attr<syn::Type>>,
     pub(crate) read_with_args: Option<Attr<FieldReadArgs>>,
     pub(crate) read_offset_args: Option<Attr<FieldReadArgs>>,
-    /// If present, a custom method that returns a FieldType for this field,
-    /// during traversal.
-    pub(crate) traverse_with: Option<Attr<syn::Ident>>,
     pub(crate) to_owned: Option<Attr<InlineExpr>>,
     /// Custom validation behaviour
     pub(crate) validate: Option<Attr<FieldValidation>>,
@@ -183,8 +180,6 @@ pub(crate) enum CountTransform {
     ItemVariationDataLen,
     /// Number of bytes to hold a bitmap of N items
     BitmapLen,
-    /// Number of bytes to hold a bitmap with max value N
-    MaxValueBitmapLen,
     /// requires exactly two args, defined as $arg1 - $arg2 + 2
     SubAddTwo,
     /// requires exactly one arg. Get the count from the $arg1.`try_into::<usize>`().
@@ -275,7 +270,6 @@ static COMPILE_TYPE: &str = "compile_type";
 static DEFAULT: &str = "default";
 static READ_WITH: &str = "read_with";
 static READ_OFFSET_WITH: &str = "read_offset_with";
-static TRAVERSE_WITH: &str = "traverse_with";
 static TO_OWNED: &str = "to_owned";
 static VALIDATE: &str = "validate";
 static DISCRIMINANT: &str = "discriminant";
@@ -343,8 +337,6 @@ impl Parse for FieldAttrs {
                 this.read_with_args = Some(Attr::new(ident.clone(), attr.parse_args()?));
             } else if ident == READ_OFFSET_WITH {
                 this.read_offset_args = Some(Attr::new(ident.clone(), attr.parse_args()?));
-            } else if ident == TRAVERSE_WITH {
-                this.traverse_with = Some(Attr::new(ident.clone(), attr.parse_args()?));
             } else if ident == FORMAT {
                 this.format = Some(Attr::new(ident.clone(), parse_attr_eq_value(&attr)?))
             } else if ident == DISCRIMINANT {
@@ -603,7 +595,6 @@ static TRANSFORM_IDENTS: &[(CountTransform, &str)] = &[
         "item_variation_data_len",
     ),
     (CountTransform::BitmapLen, "bitmap_len"),
-    (CountTransform::MaxValueBitmapLen, "max_value_bitmap_len"),
     (CountTransform::SubAddTwo, "subtract_add_two"),
     (CountTransform::TryInto, "try_into"),
 ];
@@ -641,7 +632,6 @@ impl CountTransform {
             CountTransform::TupleLen => 3,
             CountTransform::ItemVariationDataLen => 3,
             CountTransform::BitmapLen => 1,
-            CountTransform::MaxValueBitmapLen => 1,
             CountTransform::SubAddTwo => 2,
             CountTransform::TryInto => 1,
         }
@@ -740,9 +730,6 @@ impl Count {
                 }
                 (CountTransform::BitmapLen, [a]) => {
                     quote!(transforms::bitmap_len(#a))
-                }
-                (CountTransform::MaxValueBitmapLen, [a]) => {
-                    quote!(transforms::max_value_bitmap_len(#a))
                 }
                 (CountTransform::SubAddTwo, [a, b]) => {
                     quote!(transforms::subtract_add_two(#a, #b))

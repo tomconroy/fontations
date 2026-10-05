@@ -1,6 +1,5 @@
 //! Scaling support for TrueType outlines.
 
-mod deltas;
 mod hint;
 mod memory;
 mod outline;
@@ -15,13 +14,13 @@ pub use outline::{Outline, ScaledOutline};
 use super::{DrawError, GlyphHMetrics, Hinting};
 use crate::{GLYF_COMPOSITE_RECURSION_LIMIT, MAX_GLYF_POINTS, MAX_GRAPH_EDGES};
 use memory::{FreeTypeOutlineMemory, HarfBuzzOutlineMemory};
-use raw::{FontRef, ReadError};
+use raw::FontRef;
 use read_fonts::{
     tables::{
         glyf::{
             Anchor, CompositeGlyph, CompositeGlyphFlags, Glyf, Glyph, PointMarker, SimpleGlyph,
         },
-        gvar::Gvar,
+        gvar::{DeltaBuffers, Gvar},
         hdmx::Hdmx,
         loca::Loca,
     },
@@ -154,8 +153,11 @@ impl<'a> Outlines<'a> {
             has_variations: self.gvar.is_some(),
             ..Default::default()
         };
-        let glyph = self.loca.get_glyf(glyph_id, &self.glyf)?;
-        if let Some(glyph) = glyph.as_ref() {
+        let glyph = self
+            .loca
+            .get(glyph_id, &self.glyf)
+            .ok_or(DrawError::Malformed)?;
+        if let Some(glyph) = glyph.glyph() {
             self.outline_rec(glyph, &mut outline, 0, 0, &mut 0)?;
         }
         outline.points += PHANTOM_POINT_COUNT;
@@ -163,7 +165,7 @@ impl<'a> Outlines<'a> {
         outline.cvt_count = self.cvt_len as usize;
         outline.storage_count = self.max_storage as usize;
         outline.max_twilight_points = self.max_twilight_points as usize;
-        outline.glyph = glyph;
+        outline.glyph = glyph.into_glyph();
         Ok(outline)
     }
 
@@ -217,8 +219,11 @@ impl Outlines<'_> {
                 let point_base = outline.points;
                 for (component, flags) in composite.component_glyphs_and_flags() {
                     outline.has_overlaps |= flags.contains(CompositeGlyphFlags::OVERLAP_COMPOUND);
-                    let component_glyph = self.loca.get_glyf(component.into(), &self.glyf)?;
-                    let Some(component_glyph) = component_glyph else {
+                    let component_glyph = self
+                        .loca
+                        .get(component.into(), &self.glyf)
+                        .ok_or(DrawError::Malformed)?;
+                    let Some(component_glyph) = component_glyph.glyph() else {
                         continue;
                     };
                     *total_components += 1;
@@ -226,7 +231,7 @@ impl Outlines<'_> {
                         return Err(DrawError::RecursionLimitExceeded(outline.glyph_id));
                     }
                     self.outline_rec(
-                        &component_glyph,
+                        component_glyph,
                         outline,
                         component_depth + count,
                         recurse_depth + 1,
@@ -619,7 +624,9 @@ impl Scaler for FreeTypeScaler<'_> {
             .ok_or(InsufficientMemory)?;
         // Read our unscaled points and flags (up to point_count which does not
         // include phantom points).
-        glyph.read_points_fast(&mut unscaled[..point_count], &mut flags[..point_count])?;
+        glyph
+            .read_points_fast(&mut unscaled[..point_count], &mut flags[..point_count])
+            .map_err(|_| DrawError::Malformed)?;
         // Compute the range for our contour end point buffer and slice it.
         let contours_start = self.contour_count;
         let contour_end_pts = glyph.end_pts_of_contours();
@@ -636,10 +643,9 @@ impl Scaler for FreeTypeScaler<'_> {
         for (end_pt, contour) in contour_end_pts.iter().zip(contours.iter_mut()) {
             let end_pt = end_pt.get();
             if end_pt < last_end_pt {
-                return Err(ReadError::MalformedData(
-                    "unordered contour end points in TrueType glyph",
-                )
-                .into());
+                // unordered contour end points: malformed, like every other
+                // way the data can fail to make sense
+                return Err(DrawError::Malformed);
             }
             last_end_pt = end_pt;
             *contour = end_pt;
@@ -655,22 +661,33 @@ impl Scaler for FreeTypeScaler<'_> {
         let mut have_deltas = false;
         if self.outlines.gvar.is_some() && !self.coords.is_empty() {
             let gvar = self.outlines.gvar.as_ref().unwrap();
-            let glyph = deltas::SimpleGlyph {
-                points: &mut unscaled[..],
-                flags: &mut flags[..],
-                contours,
+            let mut buffers = DeltaBuffers {
+                deltas: self
+                    .memory
+                    .deltas
+                    .get_mut(..point_count + PHANTOM_POINT_COUNT)
+                    .ok_or(InsufficientMemory)?,
+                iup: self
+                    .memory
+                    .iup_buffer
+                    .get_mut(..point_count + PHANTOM_POINT_COUNT)
+                    .ok_or(InsufficientMemory)?,
             };
-            let deltas = self
-                .memory
-                .deltas
-                .get_mut(..point_count + PHANTOM_POINT_COUNT)
-                .ok_or(InsufficientMemory)?;
-            let iup_buffer = self
-                .memory
-                .iup_buffer
-                .get_mut(..point_count + PHANTOM_POINT_COUNT)
-                .ok_or(InsufficientMemory)?;
-            if deltas::simple_glyph(gvar, glyph_id, self.coords, glyph, iup_buffer, deltas).is_ok()
+            // Note that we deliberately ignore whether the glyph actually has
+            // variation data. A glyph without any yields zero deltas, but the
+            // delta-aware scaling path below rounds differently from the plain
+            // one, so keying off the return value would change the output for
+            // unvaried glyphs in a variable font.
+            if gvar
+                .simple_deltas(
+                    glyph_id,
+                    self.coords,
+                    &unscaled[..],
+                    &mut flags[..],
+                    contours,
+                    &mut buffers,
+                )
+                .is_ok()
             {
                 have_deltas = true;
             }
@@ -812,7 +829,10 @@ impl Scaler for FreeTypeScaler<'_> {
                 .composite_deltas
                 .get_mut(delta_base..delta_base + count)
                 .ok_or(InsufficientMemory)?;
-            if deltas::composite_glyph(gvar, glyph_id, self.coords, &mut deltas[..]).is_ok() {
+            if gvar
+                .composite_deltas(glyph_id, self.coords, &mut deltas[..])
+                .is_ok()
+            {
                 // Apply deltas to phantom points.
                 for (phantom, delta) in self
                     .phantom
@@ -843,7 +863,9 @@ impl Scaler for FreeTypeScaler<'_> {
             let component_glyph = self
                 .outlines
                 .loca
-                .get_glyf(component.glyph.into(), &self.outlines.glyf)?;
+                .get(component.glyph.into(), &self.outlines.glyf)
+                .ok_or(DrawError::Malformed)?
+                .into_glyph();
             self.load(&component_glyph, component.glyph.into(), recurse_depth + 1)?;
             let end_point = self.point_count;
             if !component
@@ -1128,7 +1150,9 @@ impl Scaler for HarfBuzzScaler<'_> {
             .flags
             .get_mut(point_range)
             .ok_or(InsufficientMemory)?;
-        glyph.read_points_fast(&mut points[..point_count], &mut flags[..point_count])?;
+        glyph
+            .read_points_fast(&mut points[..point_count], &mut flags[..point_count])
+            .map_err(|_| DrawError::Malformed)?;
         // Compute the range for our contour end point buffer and slice it.
         let contours_start = self.contour_count;
         let contour_end_pts = glyph.end_pts_of_contours();
@@ -1154,24 +1178,30 @@ impl Scaler for HarfBuzzScaler<'_> {
         // Acquire deltas
         if self.outlines.gvar.is_some() && !self.coords.is_empty() {
             let gvar = self.outlines.gvar.as_ref().unwrap();
-            let glyph = deltas::SimpleGlyph {
-                points: &mut points[..],
-                flags: &mut flags[..],
-                contours,
+            let mut buffers = DeltaBuffers {
+                deltas: self
+                    .memory
+                    .deltas
+                    .get_mut(..point_count + PHANTOM_POINT_COUNT)
+                    .ok_or(InsufficientMemory)?,
+                iup: self
+                    .memory
+                    .iup_buffer
+                    .get_mut(..point_count + PHANTOM_POINT_COUNT)
+                    .ok_or(InsufficientMemory)?,
             };
-            let deltas = self
-                .memory
-                .deltas
-                .get_mut(..point_count + PHANTOM_POINT_COUNT)
-                .ok_or(InsufficientMemory)?;
-            let iup_buffer = self
-                .memory
-                .iup_buffer
-                .get_mut(..point_count + PHANTOM_POINT_COUNT)
-                .ok_or(InsufficientMemory)?;
-            if deltas::simple_glyph(gvar, glyph_id, self.coords, glyph, iup_buffer, deltas).is_ok()
+            if gvar
+                .simple_deltas(
+                    glyph_id,
+                    self.coords,
+                    &points[..],
+                    &mut flags[..],
+                    contours,
+                    &mut buffers,
+                )
+                .is_ok()
             {
-                for (point, delta) in points.iter_mut().zip(deltas) {
+                for (point, delta) in points.iter_mut().zip(buffers.deltas.iter()) {
                     *point += *delta;
                 }
             }
@@ -1214,7 +1244,10 @@ impl Scaler for HarfBuzzScaler<'_> {
                 .composite_deltas
                 .get_mut(delta_base..delta_base + count)
                 .ok_or(InsufficientMemory)?;
-            if deltas::composite_glyph(gvar, glyph_id, self.coords, &mut deltas[..]).is_ok() {
+            if gvar
+                .composite_deltas(glyph_id, self.coords, &mut deltas[..])
+                .is_ok()
+            {
                 // Apply deltas to phantom points.
                 for (phantom, delta) in self
                     .phantom
@@ -1241,7 +1274,9 @@ impl Scaler for HarfBuzzScaler<'_> {
             let component_glyph = self
                 .outlines
                 .loca
-                .get_glyf(component.glyph.into(), &self.outlines.glyf)?;
+                .get(component.glyph.into(), &self.outlines.glyf)
+                .ok_or(DrawError::Malformed)?
+                .into_glyph();
             self.load(&component_glyph, component.glyph.into(), recurse_depth + 1)?;
             let end_point = self.point_count;
             if !component

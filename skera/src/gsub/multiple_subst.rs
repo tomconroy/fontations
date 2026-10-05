@@ -1,10 +1,10 @@
 //! impl subset() for MultipleSubst subtable
 use crate::fnv::FnvHashMap;
 use crate::{
-    layout::intersected_glyphs_and_indices,
+    layout::{intersected_glyphs_and_indices, map_gsub_glyph},
     offset::SerializeSerialize,
     offset_array::SubsetOffsetArray,
-    serialize::{SerializeErrorFlags, Serializer},
+    serialize::{SerializeErrorFlags, SerializeResultEmpty, Serializer},
     Plan, SubsetState, SubsetTable,
 };
 use write_fonts::{
@@ -55,13 +55,12 @@ impl<'a> SubsetTable<'a> for MultipleSubstFormat1<'_> {
 
         let mut glyphs = Vec::with_capacity(cov_glyphs.len());
         for (g, idx) in cov_glyphs.iter().zip(seq_idxes.iter()) {
-            match sequences.subset_offset(idx as usize, s, plan, ()) {
-                Ok(()) => {
-                    glyphs.push(*g);
-                    seq_count += 1;
-                }
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => (),
-                Err(e) => return Err(e),
+            if !sequences
+                .subset_offset(idx as usize, s, plan, ())
+                .is_empty()?
+            {
+                glyphs.push(*g);
+                seq_count += 1;
             }
         }
 
@@ -90,8 +89,7 @@ impl SubsetTable<'_> for Sequence<'_> {
         let glyph_map = &plan.glyph_map_gsub;
         let sub_glyphs = self.substitute_glyph_ids();
         for g in sub_glyphs {
-            let new_g = glyph_map
-                .get(&GlyphId::from(g.get()))
+            let new_g = map_gsub_glyph(glyph_map, GlyphId::from(g.get()))
                 .ok_or(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY)?;
 
             s.copy_assign(pos, new_g.to_u32() as u16);
@@ -122,14 +120,14 @@ mod test {
             panic!("Wrong type of lookup table!");
         };
         let multiplesubst_table = sub_tables.get(0).unwrap();
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            glyph_map_gsub: vec![crate::INVALID_GID; 967],
+            ..Default::default()
+        };
 
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(362_u32), GlyphId::from(5_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(512_u32), GlyphId::from(6_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(966_u32), GlyphId::from(11_u32));
+        plan.glyph_map_gsub[362] = GlyphId::from(5_u32);
+        plan.glyph_map_gsub[512] = GlyphId::from(6_u32);
+        plan.glyph_map_gsub[966] = GlyphId::from(11_u32);
 
         plan.glyphset_gsub.insert(GlyphId::from(362_u32));
         plan.glyphset_gsub.insert(GlyphId::from(512_u32));

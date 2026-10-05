@@ -112,9 +112,7 @@ impl<'a> Gvar<'a> {
     /// GlyphVariationData table.
     pub fn glyph_variation_data_offsets(&self) -> ComputedArray<'a, U16Or32> {
         let range = self.glyph_variation_data_offsets_byte_range();
-        self.data
-            .read_with_args(range, self.flags())
-            .unwrap_or_default()
+        ComputedArray::new(self.data, range, self.flags()).unwrap_or_default()
     }
 
     pub fn version_byte_range(&self) -> Range<usize> {
@@ -176,43 +174,6 @@ impl Default for Gvar<'_> {
         Self {
             data: FontData::default_table_data(),
         }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-impl<'a> SomeTable<'a> for Gvar<'a> {
-    fn type_name(&self) -> &str {
-        "Gvar"
-    }
-    fn get_field(&self, idx: usize) -> Option<Field<'a>> {
-        match idx {
-            0usize => Some(Field::new("version", self.version())),
-            1usize => Some(Field::new("axis_count", self.axis_count())),
-            2usize => Some(Field::new("shared_tuple_count", self.shared_tuple_count())),
-            3usize => Some(Field::new(
-                "shared_tuples_offset",
-                FieldType::offset(self.shared_tuples_offset(), self.shared_tuples()),
-            )),
-            4usize => Some(Field::new("glyph_count", self.glyph_count())),
-            5usize => Some(Field::new("flags", self.flags())),
-            6usize => Some(Field::new(
-                "glyph_variation_data_array_offset",
-                self.glyph_variation_data_array_offset(),
-            )),
-            7usize => Some(Field::new(
-                "glyph_variation_data_offsets",
-                traversal::FieldType::Unknown,
-            )),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-#[allow(clippy::needless_lifetimes)]
-impl<'a> std::fmt::Debug for Gvar<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (self as &dyn SomeTable<'a>).fmt(f)
     }
 }
 
@@ -510,13 +471,6 @@ impl font_types::Scalar for GvarFlags {
     }
 }
 
-#[cfg(feature = "experimental_traverse")]
-impl<'a> From<GvarFlags> for FieldType<'a> {
-    fn from(src: GvarFlags) -> FieldType<'a> {
-        src.bits().into()
-    }
-}
-
 impl<'a> MinByteRange<'a> for SharedTuples<'a> {
     fn min_byte_range(&self) -> Range<usize> {
         0..self.tuples_byte_range().end
@@ -577,9 +531,7 @@ impl<'a> SharedTuples<'a> {
 
     pub fn tuples(&self) -> ComputedArray<'a, Tuple<'a>> {
         let range = self.tuples_byte_range();
-        self.data
-            .read_with_args(range, self.axis_count())
-            .unwrap_or_default()
+        ComputedArray::new(self.data, range, self.axis_count()).unwrap_or_default()
     }
 
     pub(crate) fn shared_tuple_count(&self) -> u16 {
@@ -611,30 +563,6 @@ impl Default for SharedTuples<'_> {
             shared_tuple_count: Default::default(),
             axis_count: Default::default(),
         }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-impl<'a> SomeTable<'a> for SharedTuples<'a> {
-    fn type_name(&self) -> &str {
-        "SharedTuples"
-    }
-    fn get_field(&self, idx: usize) -> Option<Field<'a>> {
-        match idx {
-            0usize => Some(Field::new(
-                "tuples",
-                traversal::FieldType::computed_array("Tuple", self.tuples(), self.offset_data()),
-            )),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-#[allow(clippy::needless_lifetimes)]
-impl<'a> std::fmt::Debug for SharedTuples<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (self as &dyn SomeTable<'a>).fmt(f)
     }
 }
 
@@ -732,37 +660,5 @@ impl Default for GlyphVariationDataHeader<'_> {
         Self {
             data: FontData::default_table_data(),
         }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-impl<'a> SomeTable<'a> for GlyphVariationDataHeader<'a> {
-    fn type_name(&self) -> &str {
-        "GlyphVariationDataHeader"
-    }
-    fn get_field(&self, idx: usize) -> Option<Field<'a>> {
-        match idx {
-            0usize => Some(Field::new(
-                "tuple_variation_count",
-                traversal::FieldType::Unknown,
-            )),
-            1usize => Some(Field::new(
-                "serialized_data_offset",
-                traversal::FieldType::Unknown,
-            )),
-            2usize => Some(Field::new(
-                "tuple_variation_headers",
-                traversal::FieldType::Unknown,
-            )),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(feature = "experimental_traverse")]
-#[allow(clippy::needless_lifetimes)]
-impl<'a> std::fmt::Debug for GlyphVariationDataHeader<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (self as &dyn SomeTable<'a>).fmt(f)
     }
 }

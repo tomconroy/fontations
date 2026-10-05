@@ -5,7 +5,7 @@ use crate::{
     layout::{intersected_coverage_indices, intersected_glyphs_and_indices},
     offset::{SerializeSerialize, SerializeSubset},
     offset_array::SubsetOffsetArray,
-    serialize::{SerializeErrorFlags, Serializer},
+    serialize::{SerializeErrorFlags, SerializeResultEmpty, Serializer},
     CollectVariationIndices, Plan, SubsetState, SubsetTable,
 };
 use write_fonts::read::{
@@ -178,10 +178,11 @@ impl<'a> SubsetTable<'a> for LigatureArray<'_> {
 
         let lig_attaches = self.ligature_attaches();
         for (g, i) in lig_glyphs.iter().zip(lig_attach_idxes.iter()) {
-            match lig_attaches.subset_offset(i as usize, s, plan, mark_class_map) {
-                Ok(()) => retained_lig_glyphs.push(*g),
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => (),
-                Err(e) => return Err(e),
+            if !lig_attaches
+                .subset_offset(i as usize, s, plan, mark_class_map)
+                .is_empty()?
+            {
+                retained_lig_glyphs.push(*g);
             }
         }
 
@@ -214,14 +215,12 @@ impl<'a> SubsetTable<'a> for LigatureAttach<'_> {
         for component_rec in component_records.iter() {
             let component_rec = component_rec
                 .map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))?;
-            match component_rec.subset(plan, s, (font_data, mark_class_map)) {
-                Ok(()) => {
-                    if !has_non_empty_rec {
-                        has_non_empty_rec = true
-                    }
-                }
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => (),
-                Err(e) => return Err(e),
+            if !component_rec
+                .subset(plan, s, (font_data, mark_class_map))
+                .is_empty()?
+                && !has_non_empty_rec
+            {
+                has_non_empty_rec = true;
             }
         }
 
@@ -316,12 +315,13 @@ mod test {
         let markligpos_table = sub_tables.get(0).unwrap();
 
         let subset_state = SubsetState::default();
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            glyph_map_gsub: vec![crate::INVALID_GID; 69],
+            ..Default::default()
+        };
 
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(67_u32), GlyphId::from(1_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(68_u32), GlyphId::from(2_u32));
+        plan.glyph_map_gsub[67] = GlyphId::from(1_u32);
+        plan.glyph_map_gsub[68] = GlyphId::from(2_u32);
 
         plan.glyphset_gsub.insert(GlyphId::from(67_u32));
         plan.glyphset_gsub.insert(GlyphId::from(68_u32));
@@ -363,14 +363,14 @@ mod test {
         let markligpos_table = sub_tables.get(0).unwrap();
 
         let subset_state = SubsetState::default();
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            glyph_map_gsub: vec![crate::INVALID_GID; 988],
+            ..Default::default()
+        };
 
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(30_u32), GlyphId::from(1_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(987_u32), GlyphId::from(3_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(216_u32), GlyphId::from(2_u32));
+        plan.glyph_map_gsub[30] = GlyphId::from(1_u32);
+        plan.glyph_map_gsub[216] = GlyphId::from(2_u32);
+        plan.glyph_map_gsub[987] = GlyphId::from(3_u32);
 
         plan.glyphset_gsub.insert(GlyphId::from(30_u32));
         plan.glyphset_gsub.insert(GlyphId::from(216_u32));

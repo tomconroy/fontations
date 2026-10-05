@@ -7,8 +7,8 @@ use quote::{quote, ToTokens};
 use syn::spanned::Spanned;
 
 use super::parsing::{
-    logged_syn_error, Attr, Condition, Count, CountArg, CustomCompile, Field, FieldReadArgs,
-    FieldType, FieldValidation, Fields, OffsetTarget, Record,
+    logged_syn_error, Condition, Count, CountArg, CustomCompile, Field, FieldReadArgs, FieldType,
+    FieldValidation, Fields, OffsetTarget, Record,
 };
 use crate::Phase;
 
@@ -261,27 +261,6 @@ impl Fields {
         self.iter()
             .flat_map(move |fld| fld.from_obj_ref_stmt(in_record))
     }
-
-    pub(crate) fn iter_field_traversal_match_arms(
-        &self,
-        in_record: bool,
-    ) -> impl Iterator<Item = TokenStream> + '_ {
-        let pass_data = in_record.then(|| quote!(_data));
-        self.fields
-            .iter()
-            .filter(|fld| fld.has_getter())
-            .enumerate()
-            .map(move |(i, fld)| {
-                let condition = fld
-                    .attrs
-                    .conditional
-                    .as_ref()
-                    .map(|v| v.condition_tokens_for_read())
-                    .map(|cond| quote!( if #cond ));
-                let rhs = traversal_arm_for_field(fld, in_record, pass_data.as_ref());
-                quote!( #i #condition => Some(#rhs) )
-            })
-    }
 }
 
 impl Condition {
@@ -319,126 +298,6 @@ fn big_endian(typ: &syn::Ident) -> TokenStream {
     quote!(BigEndian<#typ>)
 }
 
-fn traversal_arm_for_field(
-    fld: &Field,
-    in_record: bool,
-    pass_data: Option<&TokenStream>,
-) -> TokenStream {
-    let name_str = &fld.name.to_string();
-    let name = &fld.name;
-    let maybe_unwrap = fld.attrs.conditional.is_some().then(|| quote!(.unwrap()));
-    let maybe_unwrap_getter = maybe_unwrap.as_ref().filter(|_| !fld.is_nullable());
-    if let Some(traverse_with) = &fld.attrs.traverse_with {
-        let traverse_fn = &traverse_with.attr;
-        if traverse_fn == "skip" {
-            return quote!(Field::new(#name_str, traversal::FieldType::Unknown));
-        }
-        return quote!(Field::new(#name_str, self.#traverse_fn(#pass_data)));
-    }
-    match &fld.typ {
-        FieldType::Offset {
-            target: OffsetTarget::Array(inner),
-            ..
-        } if matches!(inner.deref(), FieldType::Struct { .. }) => {
-            let typ = inner.cooked_type_tokens();
-            let getter = fld.offset_getter_name();
-            let offset_data = pass_data
-                .cloned()
-                .unwrap_or_else(|| fld.offset_getter_data_src());
-            quote!(Field::new(
-                    #name_str,
-                    traversal::FieldType::offset_to_array_of_records(
-                        self.#name()#maybe_unwrap,
-                        self.#getter(#pass_data)#maybe_unwrap_getter,
-                        stringify!(#typ),
-                        #offset_data,
-                    )
-            ))
-        }
-        FieldType::Offset { target, .. } => {
-            let constructor_name = match target {
-                OffsetTarget::Table(_) => quote!(offset),
-                OffsetTarget::Array(_) => quote!(offset_to_array_of_scalars),
-            };
-            let getter = fld.offset_getter_name();
-            quote!(Field::new(#name_str, FieldType::#constructor_name(self.#name()#maybe_unwrap, self.#getter(#pass_data)#maybe_unwrap_getter)))
-        }
-        FieldType::Scalar { .. } => quote!(Field::new(#name_str, self.#name()#maybe_unwrap)),
-
-        FieldType::Array { inner_typ } => match inner_typ.as_ref() {
-            FieldType::Scalar { .. } => quote!(Field::new(#name_str, self.#name()#maybe_unwrap)),
-            //HACK: glyf has fields that are [u8]
-            FieldType::Struct { typ } if typ == "u8" => {
-                quote!(Field::new( #name_str, self.#name()#maybe_unwrap))
-            }
-            FieldType::Struct { typ } => {
-                let offset_data = pass_data
-                    .cloned()
-                    .unwrap_or_else(|| fld.offset_getter_data_src());
-                quote!(Field::new(
-                        #name_str,
-                        traversal::FieldType::array_of_records(
-                            stringify!(#typ),
-                            self.#name()#maybe_unwrap,
-                            #offset_data,
-                        )
-                ))
-            }
-
-            FieldType::Offset {
-                target: OffsetTarget::Table(_),
-                ..
-            } => {
-                let getter = fld.offset_getter_name().unwrap();
-                quote!(Field::new(#name_str, FieldType::from(self.#getter(#pass_data)#maybe_unwrap)))
-            }
-            FieldType::Offset {
-                target: OffsetTarget::Array(_),
-                ..
-            } => panic!("achievement unlocked: 'added arrays of offsets to arrays to OpenType spec' {fld:#?}"),
-            _ => quote!(compile_error!("unhandled traversal case")),
-        },
-        FieldType::ComputedArray(arr) => {
-            // if we are in a record, we pass in empty data. This lets us
-            // avoid a special case in the single instance where this happens, in
-            // Class1Record
-            let data = if in_record {
-                quote!(FontData::new(&[]))
-            } else {
-                fld.offset_getter_data_src()
-            };
-            // in a record we return things by value, so clone
-            let maybe_clone = in_record.then(|| quote!(.clone()));
-            let typ_str = arr.raw_inner_type().to_string();
-            quote!(Field::new(
-                    #name_str,
-                    traversal::FieldType::computed_array(
-                        #typ_str,
-                        self.#name()#maybe_clone #maybe_unwrap,
-                        #data
-                    )
-            ))
-        }
-        FieldType::VarLenArray(arr) => {
-            let typ_str = arr.raw_inner_type().to_string();
-            let data = fld.offset_getter_data_src();
-            quote!(Field::new(#name_str, traversal::FieldType::var_array(#typ_str, self.#name()#maybe_unwrap, #data)))
-        }
-        // See if there are better ways to handle these hardcoded types
-        // <https://github.com/googlefonts/fontations/issues/659>
-        FieldType::Struct { typ } if typ == "ValueRecord" || typ == "SbitLineMetrics" => {
-            let offset_data = pass_data
-                .cloned()
-                .unwrap_or_else(|| fld.offset_getter_data_src());
-            quote!(Field::new(#name_str, self.#name() #maybe_unwrap .traversal_type(#offset_data)))
-        }
-        FieldType::Struct { .. } => {
-            quote!(compile_error!(concat!("another weird type: ", #name_str)))
-        }
-        FieldType::PendingResolution { .. } => panic!("Should have resolved {fld:#?}"),
-    }
-}
-
 fn check_resolution(phase: Phase, field_type: &FieldType) -> syn::Result<()> {
     if let Phase::Parse = phase {
         return Ok(());
@@ -459,6 +318,7 @@ impl Field {
                 quote!(BigEndian<Nullable<#typ>>)
             }
             FieldType::Offset { typ, .. } | FieldType::Scalar { typ } => big_endian(typ),
+            FieldType::Struct { typ } if self.positioned => quote!(#typ<'a>),
             FieldType::Struct { typ } => typ.to_token_stream(),
             FieldType::ComputedArray(array) => {
                 let inner = array.type_with_lifetime();
@@ -513,6 +373,12 @@ impl Field {
         match &self.typ {
             _ if self.is_conditional() => None,
             FieldType::Offset { typ, .. } | FieldType::Scalar { typ } => {
+                Some(quote!(#typ :: RAW_BYTE_LEN))
+            }
+            // an embedded record occupies a known number of bytes, so it
+            // both counts toward MIN_SIZE and lets the fields after it be
+            // validated at parse
+            FieldType::Struct { typ } if self.fixed_size_record => {
                 Some(quote!(#typ :: RAW_BYTE_LEN))
             }
             FieldType::Array { .. }
@@ -652,6 +518,7 @@ impl Field {
     pub(crate) fn raw_getter_return_type(&self) -> TokenStream {
         match &self.typ {
             FieldType::Offset { typ, .. } if self.is_nullable() => quote!(Nullable<#typ>),
+            FieldType::Struct { typ } if self.positioned => quote!(#typ<'a>),
             FieldType::Offset { typ, .. }
             | FieldType::Scalar { typ }
             | FieldType::Struct { typ } => typ.to_token_stream(),
@@ -701,6 +568,14 @@ impl Field {
             return None;
         }
         let return_type = self.raw_getter_return_type();
+        // a table instantiates its fields on access, so an embedded record is
+        // borrowed out of the table's data. (Records hold their fields, and
+        // add this borrow themselves; see `record_getter`.)
+        let return_type = if self.fixed_size_record {
+            quote!(&'a #return_type)
+        } else {
+            return_type
+        };
         if self.is_conditional() {
             Some(quote!(Option<#return_type>))
         } else {
@@ -726,13 +601,39 @@ impl Field {
             (maybe_unwrap.is_none() && !is_conditional).then(|| quote!( .unwrap_or_default() ));
 
         let range_stmt = self.getter_range_stmt();
-        let mut read_stmt = if let Some(args) = &self.attrs.read_with_args {
+        let mut read_stmt = if self.is_computed_array() {
+            // an array keeps the table's data rather than a slice of it, so
+            // that a positioned item can resolve offsets against the table
+            let get_args = self
+                .attrs
+                .read_with_args
+                .as_ref()
+                .expect("a computed array has read args")
+                .to_tokens_for_table_getter();
+            quote!( ComputedArray::new(self.data, range, #get_args) #maybe_unwrap_or_def )
+        } else if let Some(args) = self
+            .attrs
+            .read_with_args
+            .as_ref()
+            .filter(|_| self.positioned)
+        {
+            // a positioned item gets the table's whole data plus where it
+            // starts within it
+            let get_args = args.to_tokens_for_table_getter();
+            let typ = self.typ.cooked_type_tokens();
+            quote!( #typ::read_at(self.data, range.start, #get_args) #maybe_unwrap_or_def )
+        } else if let Some(args) = &self.attrs.read_with_args {
             let get_args = args.to_tokens_for_table_getter();
             quote!( self.data.read_with_args(range, #get_args) #maybe_unwrap_or_def )
         } else if is_var_array {
             quote!( self.data.split_off(range.start).and_then(|d| VarLenArray::read(d).ok()) #maybe_unwrap_or_def )
         } else if is_array {
             quote!(self.data.read_array(range).ok() #maybe_unwrap #maybe_unwrap_or_def)
+        } else if self.fixed_size_record {
+            // there is no default to fall back on for a borrowed record, so
+            // this relies on the field being validated at parse; see
+            // `Field::sanity_check`
+            quote!(self.data.read_ref_at(range.start).ok() #maybe_unwrap)
         } else {
             quote!(self.data.read_at(range.start).ok() #maybe_unwrap #maybe_unwrap_or_def)
         };
@@ -960,17 +861,6 @@ impl Field {
         Some(syn::Ident::new(&name_string, self.name.span()))
     }
 
-    /// if the `#[offset_data_method]` attribute is specified, self.#method(),
-    /// else return self.offset_data().
-    ///
-    /// This does not make sense in records.
-    fn offset_getter_data_src(&self) -> TokenStream {
-        match self.attrs.offset_data.as_ref() {
-            Some(Attr { attr, .. }) => quote!(self.#attr()),
-            None => quote!(self.offset_data()),
-        }
-    }
-
     /// The expression for evaluating the length in bytes of this field
     pub(crate) fn field_len_expr(&self) -> TokenStream {
         let len_expr = self.computed_len_expr(true).unwrap_or_else(|| {
@@ -1091,6 +981,7 @@ impl Field {
                 .as_deref()
                 .map(FieldReadArgs::to_tokens_for_validation)
             {
+                Some(args) if self.positioned => quote!(cursor.read_at_with_args(#args)?),
                 Some(args) => quote!(cursor.read_with_args(#args)?),
                 None => quote!(cursor.read_be()?),
             },

@@ -8,6 +8,15 @@ use types::{F26Dot6, Point};
 
 include!("../../generated/generated_glyf.rs");
 
+/// Number of "phantom" points appended to the end of a glyph outline.
+///
+/// These are not part of the glyph's contours. They carry the horizontal and
+/// vertical side bearings and advances so that variation deltas and the
+/// TrueType interpreter can adjust glyph metrics along with the outline.
+///
+/// See [phantom points](https://learn.microsoft.com/en-us/typography/opentype/spec/tt_instructing_glyphs#phantom-points).
+pub const PHANTOM_POINT_COUNT: usize = 4;
+
 /// Marker bits for point flags that are set during variation delta
 /// processing and hinting.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
@@ -251,19 +260,30 @@ impl<'a> SimpleGlyph<'a> {
                 break;
             }
         }
-        let mut cursor = FontData::new(self.glyph_data()).cursor();
-        cursor.advance_by(read_flags_bytes);
+        // This used to use a `Cursor` but that implies saturating
+        // arithmetic, bounds checking and `Result` building for each byte
+        // read.
+        //
+        // A byte slice iterator is just a pointer comparison and is
+        // significantly faster.
+        let coords = self
+            .glyph_data()
+            .get(read_flags_bytes..)
+            .ok_or(ReadError::OutOfBounds)?;
+        let mut bytes = coords.iter();
         let mut x = 0i32;
         for (&point_flags, point) in flags.iter().zip(points.as_mut()) {
             let mut delta = 0i32;
             let flag = SimpleGlyphFlags::from_bits_truncate(point_flags.0);
             if flag.contains(SimpleGlyphFlags::X_SHORT_VECTOR) {
-                delta = cursor.read::<u8>()? as i32;
+                delta = *bytes.next().ok_or(ReadError::OutOfBounds)? as i32;
                 if !flag.contains(SimpleGlyphFlags::X_IS_SAME_OR_POSITIVE_X_SHORT_VECTOR) {
                     delta = -delta;
                 }
             } else if !flag.contains(SimpleGlyphFlags::X_IS_SAME_OR_POSITIVE_X_SHORT_VECTOR) {
-                delta = cursor.read::<i16>()? as i32;
+                let hi = *bytes.next().ok_or(ReadError::OutOfBounds)?;
+                let lo = *bytes.next().ok_or(ReadError::OutOfBounds)?;
+                delta = i16::from_be_bytes([hi, lo]) as i32;
             }
             x = x.wrapping_add(delta);
             point.x = C::from_i32(x);
@@ -273,12 +293,14 @@ impl<'a> SimpleGlyph<'a> {
             let mut delta = 0i32;
             let flag = SimpleGlyphFlags::from_bits_truncate(point_flags.0);
             if flag.contains(SimpleGlyphFlags::Y_SHORT_VECTOR) {
-                delta = cursor.read::<u8>()? as i32;
+                delta = *bytes.next().ok_or(ReadError::OutOfBounds)? as i32;
                 if !flag.contains(SimpleGlyphFlags::Y_IS_SAME_OR_POSITIVE_Y_SHORT_VECTOR) {
                     delta = -delta;
                 }
             } else if !flag.contains(SimpleGlyphFlags::Y_IS_SAME_OR_POSITIVE_Y_SHORT_VECTOR) {
-                delta = cursor.read::<i16>()? as i32;
+                let hi = *bytes.next().ok_or(ReadError::OutOfBounds)?;
+                let lo = *bytes.next().ok_or(ReadError::OutOfBounds)?;
+                delta = i16::from_be_bytes([hi, lo]) as i32;
             }
             y = y.wrapping_add(delta);
             point.y = C::from_i32(y);
@@ -356,7 +378,7 @@ struct PointIter<'a> {
     flags: Cursor<'a>,
     x_coords: Cursor<'a>,
     y_coords: Cursor<'a>,
-    flag_repeats: u8,
+    flag_repeats: u16,
     cur_flags: SimpleGlyphFlags,
     cur_x: i16,
     cur_y: i16,
@@ -391,9 +413,9 @@ impl<'a> PointIter<'a> {
             self.flag_repeats = self
                 .cur_flags
                 .contains(SimpleGlyphFlags::REPEAT_FLAG)
-                .then(|| self.flags.read().ok())
+                .then(|| self.flags.read::<u8>().ok())
                 .flatten()
-                .unwrap_or(0)
+                .unwrap_or(0) as u16
                 + 1;
         }
         self.flag_repeats -= 1;
@@ -700,29 +722,6 @@ impl Iterator for ComponentGlyphIdFlagsIter<'_> {
     }
 }
 
-#[cfg(feature = "experimental_traverse")]
-impl<'a> SomeTable<'a> for Component {
-    fn type_name(&self) -> &str {
-        "Component"
-    }
-
-    fn get_field(&self, idx: usize) -> Option<Field<'a>> {
-        match idx {
-            0 => Some(Field::new("flags", self.flags.bits())),
-            1 => Some(Field::new("glyph", self.glyph)),
-            2 => match self.anchor {
-                Anchor::Point { base, .. } => Some(Field::new("base", base)),
-                Anchor::Offset { x, .. } => Some(Field::new("x", x)),
-            },
-            3 => match self.anchor {
-                Anchor::Point { component, .. } => Some(Field::new("component", component)),
-                Anchor::Offset { y, .. } => Some(Field::new("y", y)),
-            },
-            _ => None,
-        }
-    }
-}
-
 impl Anchor {
     /// Compute the flags that describe this anchor
     pub fn compute_flags(&self) -> CompositeGlyphFlags {
@@ -862,7 +861,10 @@ mod tests {
         let font = FontRef::new(font_test_data::COLR_GRADIENT_RECT).unwrap();
         let loca = font.loca(None).unwrap();
         let glyf = font.glyf().unwrap();
-        let glyph = loca.get_glyf(GlyphId::new(0), &glyf).unwrap().unwrap();
+        let glyph = loca
+            .get(GlyphId::new(0), &glyf)
+            .and_then(|g| g.into_glyph())
+            .unwrap();
         assert_eq!(glyph.number_of_contours(), 2);
         let simple_glyph = if let Glyph::Simple(simple) = glyph {
             simple
@@ -901,7 +903,10 @@ mod tests {
         let loca = font.loca(None).unwrap();
         let glyf = font.glyf().unwrap();
         let glyph_count = font.maxp().unwrap().num_glyphs() as u32;
-        (0..glyph_count).map(move |gid| loca.get_glyf(GlyphId::new(gid), &glyf).unwrap())
+        (0..glyph_count).map(move |gid| {
+            loca.get(GlyphId::new(gid), &glyf)
+                .and_then(|g| g.into_glyph())
+        })
     }
 
     #[test]
@@ -1031,7 +1036,10 @@ mod tests {
         let font = FontRef::new(font_test_data::CUBIC_GLYF).unwrap();
         let loca = font.loca(None).unwrap();
         let glyf = font.glyf().unwrap();
-        let glyph = loca.get_glyf(GlyphId::new(2), &glyf).unwrap().unwrap();
+        let glyph = loca
+            .get(GlyphId::new(2), &glyf)
+            .and_then(|g| g.into_glyph())
+            .unwrap();
         assert_eq!(glyph.number_of_contours(), 1);
         let simple_glyph = if let Glyph::Simple(simple) = glyph {
             simple
@@ -1128,6 +1136,16 @@ mod tests {
         let actual: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn point_iter_repeat_count_255_does_not_overflow() {
+        // repeat byte 0xFF means the same flag applies to 256 points total
+        let flags = [SimpleGlyphFlags::REPEAT_FLAG.bits(), 0xFF];
+        // 256 coords of 2 bytes each
+        let coords = [0u8; 256 * 2];
+        let iter = PointIter::new(&flags, &coords, &coords);
+        assert_eq!(iter.count(), 256);
     }
 
     #[test]

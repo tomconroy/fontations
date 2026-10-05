@@ -74,6 +74,8 @@ extern crate core as std;
 extern crate alloc;
 
 pub mod array;
+#[cfg(any(test, feature = "codegen_test"))]
+pub mod codegen_test;
 pub mod collections;
 mod font_data;
 pub mod model;
@@ -84,16 +86,11 @@ mod read;
 mod table_provider;
 mod table_ref;
 pub mod tables;
-#[cfg(feature = "experimental_traverse")]
-pub mod traversal;
-
-#[cfg(any(test, feature = "codegen_test"))]
-pub mod codegen_test;
 
 pub use font_data::FontData;
 pub use offset::{Offset, ResolveNullableOffset, ResolveOffset};
 pub use offset_array::{ArrayOfNullableOffsets, ArrayOfOffsets};
-pub use read::{ComputeSize, FontRead, ReadArgs, ReadError, VarSize};
+pub use read::{ComputeSize, FontRead, FontReadAt, ReadArgs, ReadError, VarSize};
 pub use table_provider::{TableProvider, TopLevelTable};
 pub use table_ref::MinByteRange;
 
@@ -108,16 +105,13 @@ pub(crate) mod codegen_prelude {
     pub use crate::offset::{Offset, ResolveNullableOffset, ResolveOffset};
     pub use crate::offset_array::{ArrayOfNullableOffsets, ArrayOfOffsets};
     pub use crate::read::{
-        ComputeSize, Discriminant, FontRead, Format, ReadArgs, ReadError, VarSize,
+        ComputeSize, Discriminant, FontRead, FontReadAt, Format, ReadArgs, ReadError, VarSize,
     };
     pub use crate::table_provider::TopLevelTable;
     pub use crate::table_ref::MinByteRange;
     pub use std::ops::Range;
 
     pub use types::*;
-
-    #[cfg(feature = "experimental_traverse")]
-    pub use crate::traversal::{self, Field, FieldType, RecordResolver, SomeRecord, SomeTable};
 
     /// named transforms used in 'count', e.g
     pub(crate) mod transforms {
@@ -140,12 +134,6 @@ pub(crate) mod codegen_prelude {
         #[allow(dead_code)]
         pub fn bitmap_len<T: TryInto<usize>>(count: T) -> usize {
             count.try_into().unwrap_or_default().div_ceil(8)
-        }
-
-        #[cfg(feature = "ift")]
-        pub fn max_value_bitmap_len<T: TryInto<usize>>(count: T) -> usize {
-            let count: usize = count.try_into().unwrap_or_default() + 1usize;
-            count.div_ceil(8)
         }
 
         pub fn add_multiply<T: TryInto<usize>, U: TryInto<usize>, V: TryInto<usize>>(

@@ -173,6 +173,10 @@ pub trait TableProvider<'a> {
         self.expect_table()
     }
 
+    fn mort(&self) -> Result<tables::mort::Mort<'a>, ReadError> {
+        self.expect_table()
+    }
+
     fn kerx(&self) -> Result<tables::kerx::Kerx<'a>, ReadError> {
         self.expect_table()
     }
@@ -225,13 +229,13 @@ pub trait TableProvider<'a> {
     }
 
     #[cfg(feature = "ift")]
-    fn ift(&self) -> Result<tables::ift::Ift<'a>, ReadError> {
+    fn ift(&self) -> Result<tables::ift::IftPatchMap<'a>, ReadError> {
         self.expect_data_for_tag(tables::ift::IFT_TAG)
             .and_then(FontRead::read)
     }
 
     #[cfg(feature = "ift")]
-    fn iftx(&self) -> Result<tables::ift::Ift<'a>, ReadError> {
+    fn iftx(&self) -> Result<tables::ift::IftPatchMap<'a>, ReadError> {
         self.expect_data_for_tag(tables::ift::IFTX_TAG)
             .and_then(FontRead::read)
     }

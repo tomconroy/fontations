@@ -1,7 +1,7 @@
 //! Read layout tables in a graph
 use crate::fnv::FnvHashMap;
 use crate::{
-    graph::{Graph, RepackError},
+    graph::{Graph, Parents, RepackError},
     serialize::{Link, LinkWidth, ObjIdx},
 };
 use write_fonts::types::{FixedSize, Offset16, Scalar};
@@ -172,7 +172,7 @@ impl Graph {
             idx
         };
 
-        for l in self.vertices[lookup_idx].real_links.values_mut() {
+        for l in self.vertices[lookup_idx].real_links.iter_mut() {
             if l.obj_idx() == subtable_idx {
                 l.update_obj_idx(ext_idx);
             }
@@ -249,6 +249,8 @@ impl Graph {
         let new_lookup_v = self
             .mut_vertex(lookup_index)
             .ok_or(RepackError::GraphErrorInvalidObjIndex)?;
+
+        new_lookup_v.real_links.clear();
         for i in 0..num_subtables as u32 {
             let subtable_idx = subtable_idxes
                 .get(i as usize)
@@ -257,17 +259,25 @@ impl Graph {
             let pos = start_pos + Offset16::RAW_BYTE_LEN as u32 * i;
             new_lookup_v
                 .real_links
-                .entry(pos)
-                .and_modify(|l| l.update_obj_idx(*subtable_idx))
-                .or_insert(Link::new(LinkWidth::Two, *subtable_idx, pos));
+                .add_link(Link::new(LinkWidth::Two, *subtable_idx, pos));
         }
 
         for subtable in subtable_idxes {
             let subtable_v = self
                 .mut_vertex(*subtable)
                 .ok_or(RepackError::GraphErrorInvalidObjIndex)?;
-            if subtable_v.parents.contains_key(&lookup_index) {
-                continue;
+            match &subtable_v.parents {
+                Parents::Single(single_parent) => {
+                    if *single_parent == lookup_index {
+                        continue;
+                    }
+                }
+                Parents::Multiple(parents_map) => {
+                    if parents_map.contains_key(&lookup_index) {
+                        continue;
+                    }
+                }
+                Parents::Empty => (),
             }
             subtable_v.add_parent(lookup_index, false);
         }

@@ -350,6 +350,10 @@ impl<'a> TableProvider<'a> for &'a FontTables {
         self.load_table(self.morx_state())
     }
 
+    fn mort(&self) -> Result<tables::mort::Mort<'a>, ReadError> {
+        self.load_table(self.mort_state())
+    }
+
     fn kerx(&self) -> Result<tables::kerx::Kerx<'a>, ReadError> {
         self.load_table(self.kerx_state())
     }
@@ -401,12 +405,12 @@ impl<'a> TableProvider<'a> for &'a FontTables {
     }
 
     #[cfg(feature = "ift")]
-    fn ift(&self) -> Result<tables::ift::Ift<'a>, ReadError> {
+    fn ift(&self) -> Result<tables::ift::IftPatchMap<'a>, ReadError> {
         self.load_table_with_tag(self.ift_state(), Tag::new(b"IFT "))
     }
 
     #[cfg(feature = "ift")]
-    fn iftx(&self) -> Result<tables::ift::Ift<'a>, ReadError> {
+    fn iftx(&self) -> Result<tables::ift::IftPatchMap<'a>, ReadError> {
         self.load_table_with_tag(self.iftx_state(), Tag::new(b"IFTX"))
     }
 

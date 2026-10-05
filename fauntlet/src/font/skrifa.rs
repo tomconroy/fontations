@@ -6,7 +6,7 @@ use skrifa::{
     raw::{
         ps::{cff::CffFontRef, type1::Type1Font},
         types::F2Dot14,
-        FontRef, ReadError, TableProvider,
+        FontRef, TableProvider,
     },
     GlyphId, MetadataProvider, OutlineGlyphCollection,
 };
@@ -143,7 +143,7 @@ impl<'a> SkrifaSfntInstance<'a> {
     pub fn hvar_and_gvar_advance_deltas(&self, glyph_id: GlyphId) -> Option<(i32, i32)> {
         let hvar = self.font.hvar().ok()?;
         let gvar = self.font.gvar().ok()?;
-        let hvar_delta = hvar.advance_width_delta(glyph_id, &self.coords).ok()?;
+        let hvar_delta = hvar.advance_delta(glyph_id, &self.coords)?;
         let gvar_delta = gvar
             .phantom_point_deltas(
                 &self.font.glyf().ok()?,
@@ -214,7 +214,7 @@ impl<'a> SkrifaCffInstance<'a> {
         let subfont = self.font.subfont(
             self.font
                 .subfont_index(glyph_id)
-                .ok_or(ReadError::OutOfBounds)?,
+                .ok_or(DrawError::Malformed)?,
             &[],
         )?;
         Ok(self.font.draw(&subfont, glyph_id, &[], self.ppem, pen)?)

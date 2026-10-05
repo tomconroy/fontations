@@ -4,7 +4,7 @@ use crate::fnv::FnvHashMap;
 use crate::{
     layout::{intersected_coverage_indices, intersected_glyphs_and_indices},
     offset::{SerializeSerialize, SerializeSubset},
-    serialize::{SerializeErrorFlags, Serializer},
+    serialize::{SerializeErrorFlags, SerializeResultEmpty, Serializer},
     CollectVariationIndices, Plan, SubsetState, SubsetTable,
 };
 use write_fonts::{
@@ -56,10 +56,8 @@ impl<'a> SubsetTable<'a> for CursivePosFormat1<'_> {
             let Some(exit_record) = exit_records.get(i as usize) else {
                 return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
             };
-            match exit_record.subset(plan, s, font_data) {
-                Ok(()) => entry_exit_count += 1,
-                Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY) => (),
-                Err(e) => return Err(e),
+            if !exit_record.subset(plan, s, font_data).is_empty()? {
+                entry_exit_count += 1;
             }
         }
 
@@ -147,12 +145,13 @@ mod test {
         let cursivepos_table = sub_tables.get(0).unwrap();
 
         let subset_state = SubsetState::default();
-        let mut plan = Plan::default();
+        let mut plan = Plan {
+            glyph_map_gsub: vec![crate::INVALID_GID; 3099],
+            ..Default::default()
+        };
 
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(1803_u32), GlyphId::from(2_u32));
-        plan.glyph_map_gsub
-            .insert(GlyphId::from(3098_u32), GlyphId::from(4_u32));
+        plan.glyph_map_gsub[1803] = GlyphId::from(2_u32);
+        plan.glyph_map_gsub[3098] = GlyphId::from(4_u32);
         plan.glyphset_gsub.insert(GlyphId::from(1803_u32));
         plan.glyphset_gsub.insert(GlyphId::from(3098_u32));
 
